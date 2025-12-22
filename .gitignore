@@ -1,0 +1,125 @@
+########################################
+# General OS / Editor
+########################################
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+########################################
+# Python
+########################################
+__pycache__/
+*.py[cod]
+*.pyd
+*.so
+*.dylib
+*.egg-info/
+build/
+dist/
+*.egg
+
+# Virtualenv / Conda
+.venv/
+venv/
+env/
+.conda/
+conda/
+pip-wheel-metadata/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Test / tooling caches
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.cache/
+.coverage
+htmlcov/
+
+########################################
+# Logs / Slurm outputs (OSC)
+########################################
+# Top-level
+logs/
+runs/
+
+# Common slurm output patterns anywhere
+slurm-*.out
+slurm-*.err
+*.out
+*.err
+
+# If you keep job scripts under jobs/, ignore job outputs aggressively
+jobs/**/logs/
+jobs/**/*.out
+jobs/**/*.err
+jobs/**/slurm-*.out
+jobs/**/slurm-*.err
+
+########################################
+# Experiment tracking (CleanRL + common RL tools)
+########################################
+# CleanRL commonly writes here
+cleanrl/runs/
+cleanrl/logs/
+cleanrl/wandb/
+cleanrl/tensorboard/
+cleanrl/tb/
+cleanrl/outputs/
+cleanrl/results/
+
+# Also ignore these anywhere (in case other modules write them)
+**/wandb/
+**/tensorboard/
+**/tb/
+**/outputs/
+**/results/
+
+########################################
+# Model checkpoints / artifacts (large)
+########################################
+checkpoints/
+checkpoint/
+ckpt/
+models/
+model/
+
+*.pt
+*.pth
+*.ckpt
+*.onnx
+*.pkl
+*.joblib
+
+########################################
+# Datasets / arrays (large)
+########################################
+data/
+dataset/
+datasets/
+
+# Numpy / scientific data blobs (often huge)
+*.npz
+*.npy
+*.h5
+*.hdf5
+*.mat
+
+# If open-kbp-opt 或 pyRadPlan 下有数据目录，也一并忽略
+open-kbp-opt/**/data/
+open-kbp-opt/**/datasets/
+pyRadPlan/**/data/
+pyRadPlan/**/datasets/
+rlfplan/**/data/
+rlfplan/**/datasets/
+
+########################################
+# Docker / misc generated
+########################################
+*.tar
+*.tar.gz
+*.tgz
+*.zip
+*.7z
