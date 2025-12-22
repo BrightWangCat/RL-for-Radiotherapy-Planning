@@ -42,4 +42,5 @@ python scripts/e_train_openkbp_ppo.py \
   --total-timesteps 500000 \
   --learning-rate 3e-4 \
   --num-envs 4 \
-  --cuda
+  --cuda \
+  --save-model
