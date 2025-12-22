@@ -123,3 +123,6 @@ rlfplan/**/datasets/
 *.tgz
 *.zip
 *.7z
+
+# Prevent embedded repos from being tracked again
+**/.git/
