@@ -28,7 +28,7 @@ export OPENKBP_STEP_SCALE="0.05"
 export OPENKBP_OAR_LAMBDA="0.02"
 export OPENKBP_SEED="0"
 
-RUN_DIR="runs/<RUN_C_DIR>"
+RUN_DIR="runs/OpenKBPGrouped-v0__ppo_continuous_action__1__1766505770"
 
 echo "=== deterministic ==="
 python scripts/f_eval_saved_policy.py --run-dir "${RUN_DIR}" --episodes 20
