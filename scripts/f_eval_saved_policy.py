@@ -14,8 +14,30 @@ sys.path.insert(0, os.path.join(PROJECT_ROOT, "cleanrl"))
 import rlfplan.register_envs  # noqa: F401  (registers OpenKBPGrouped-v0)
 
 
+def make_env():
+    """
+    Reproduce the common CleanRL wrappers used in ppo_continuous_action:
+      - RecordEpisodeStatistics
+      - ClipAction
+      - NormalizeObservation + clip
+      - NormalizeReward + clip
+    """
+    env = gym.make("OpenKBPGrouped-v0")
+    env = gym.wrappers.RecordEpisodeStatistics(env)
+    env = gym.wrappers.ClipAction(env)
+
+    # These wrappers are commonly used in CleanRL PPO continuous scripts
+    env = gym.wrappers.NormalizeObservation(env)
+    env = gym.wrappers.TransformObservation(env, lambda obs: np.clip(obs, -10, 10))
+
+    env = gym.wrappers.NormalizeReward(env, gamma=0.99)
+    env = gym.wrappers.TransformReward(env, lambda r: float(np.clip(r, -10, 10)))
+
+    return env
+
+
 def find_latest_checkpoint(run_dir: str) -> str:
-    pats = ["*.pt", "*.pth", "*model*"]
+    pats = ["*.cleanrl_model", "*.pt", "*.pth", "*model*"]
     cands = []
     for p in pats:
         cands.extend(glob.glob(os.path.join(run_dir, p)))
@@ -27,49 +49,48 @@ def find_latest_checkpoint(run_dir: str) -> str:
     return cands[0]
 
 
-def load_agent(envs, ckpt_path: str, device: torch.device):
-    # Import Agent definition from CleanRL continuous PPO script
+def torch_load_weights(path: str, device: torch.device):
+    # Avoid the torch FutureWarning when possible (your file is weights only)
+    try:
+        return torch.load(path, map_location=device, weights_only=True)
+    except TypeError:
+        return torch.load(path, map_location=device)
+
+
+def build_agent(envs, device: torch.device):
     import cleanrl.ppo_continuous_action as ppo_mod
-
     agent = ppo_mod.Agent(envs).to(device)
+    return agent
 
-    ckpt = torch.load(ckpt_path, map_location=device)
-    # Robust load: support different checkpoint dict formats
-    if isinstance(ckpt, dict):
-        for key in ["agent", "state_dict", "model_state_dict"]:
-            if key in ckpt and isinstance(ckpt[key], dict):
-                agent.load_state_dict(ckpt[key], strict=False)
-                return agent
-        # sometimes ckpt itself is a state_dict-like dict
-        agent.load_state_dict(ckpt, strict=False)
-        return agent
-    else:
-        # rare case: whole model saved
-        try:
-            agent.load_state_dict(ckpt, strict=False)
-            return agent
-        except Exception:
-            raise ValueError(f"Unrecognized checkpoint format: {type(ckpt)}")
+
+def load_state_dict_strict(agent: torch.nn.Module, ckpt_obj):
+    if not isinstance(ckpt_obj, dict):
+        raise ValueError(f"Checkpoint is not a dict/state_dict: {type(ckpt_obj)}")
+    # strict=True：不允许静默失败
+    agent.load_state_dict(ckpt_obj, strict=True)
 
 
 @torch.no_grad()
-def rollout(agent, env, device, deterministic: bool, max_steps: int):
+def rollout(agent, env, device: torch.device, max_steps: int, deterministic: bool = True):
     obs, info = env.reset()
     ret = 0.0
     err_sum = 0.0
     oar_sum = 0.0
     steps = 0
-
     last_info = {}
 
     for _ in range(max_steps):
         x = torch.tensor(obs, dtype=torch.float32, device=device).unsqueeze(0)
 
-        # CleanRL API: get_action_and_value returns action (and others)
-        # Deterministic eval: we still call the method; many versions sample stochastically.
-        # For stability now, keep stochastic but seed-controlled; deterministic flag is kept for future extension.
-        action, _, _, _ = agent.get_action_and_value(x)
-        a = action.squeeze(0).cpu().numpy()
+        if deterministic:
+            # Deterministic action: use actor mean (env has ClipAction wrapper)
+            if not hasattr(agent, "actor_mean"):
+                raise AttributeError("Agent has no attribute 'actor_mean' (unexpected CleanRL version).")
+            action = agent.actor_mean(x)
+        else:
+            action, _, _, _ = agent.get_action_and_value(x)
+
+        a = action.squeeze(0).detach().cpu().numpy()
 
         obs, r, term, trunc, step_info = env.step(a)
         ret += float(r)
@@ -96,28 +117,38 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--run-dir", required=True, help="Path to a runs/<run_name> directory")
     ap.add_argument("--episodes", type=int, default=5)
-    ap.add_argument("--deterministic", action="store_true")
     ap.add_argument("--max-steps", type=int, default=int(os.environ.get("OPENKBP_MAX_STEPS", "50")))
+    ap.add_argument("--stochastic", action="store_true", help="use stochastic actions instead of deterministic mean")
     args = ap.parse_args()
 
     run_dir = args.run_dir.rstrip("/")
-    ckpt = find_latest_checkpoint(run_dir)
-    print("Using checkpoint:", ckpt)
-
-    # Single env for evaluation
-    env = gym.make("OpenKBPGrouped-v0")
-    env = gym.wrappers.RecordEpisodeStatistics(env)
-
-    # Vector env wrapper to satisfy CleanRL Agent(envs) signature
-    envs = gym.vector.SyncVectorEnv([lambda: gym.make("OpenKBPGrouped-v0")])
+    ckpt_path = find_latest_checkpoint(run_dir)
+    print("Using checkpoint:", ckpt_path)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    agent = load_agent(envs, ckpt, device)
+
+    # Build vector env for Agent signature, and a single env for rollout
+    envs = gym.vector.SyncVectorEnv([lambda: make_env()])
+    env = make_env()
+
+    agent = build_agent(envs, device)
+    ckpt = torch_load_weights(ckpt_path, device)
+    load_state_dict_strict(agent, ckpt)
     agent.eval()
+
+    # Optional: warm up normalization statistics a bit (helps if wrappers start “cold”)
+    # Run a few random steps so NormalizeObservation/Reward has sane stats.
+    warm_steps = 200
+    o, _ = env.reset()
+    for _ in range(warm_steps):
+        a = env.action_space.sample()
+        o, _, term, trunc, _ = env.step(a)
+        if term or trunc:
+            o, _ = env.reset()
 
     results = []
     for i in range(args.episodes):
-        res = rollout(agent, env, device, args.deterministic, args.max_steps)
+        res = rollout(agent, env, device, args.max_steps, deterministic=(not args.stochastic))
         results.append(res)
         print(
             f"[ep {i+1:02d}] return={res['return']:.4f} "
@@ -125,7 +156,6 @@ def main():
             f"ptv70_mean={res['ptv70_mean']:.3f} ref={res['ptv70_ref_mean']:.3f}"
         )
 
-    # summary
     def mean(k): return float(np.mean([r[k] for r in results]))
     print("\n=== SUMMARY ===")
     print("episodes:", args.episodes)
