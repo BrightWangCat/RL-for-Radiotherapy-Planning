@@ -43,4 +43,6 @@ python scripts/e_train_openkbp_ppo.py \
   --learning-rate 3e-4 \
   --num-envs 4 \
   --cuda \
-  --save-model
+  --save-model \
+  --no-capture-video
+
