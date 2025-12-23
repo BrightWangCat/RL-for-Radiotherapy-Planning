@@ -25,14 +25,6 @@ def make_env():
     env = gym.make("OpenKBPGrouped-v0")
     env = gym.wrappers.RecordEpisodeStatistics(env)
     env = gym.wrappers.ClipAction(env)
-
-    # These wrappers are commonly used in CleanRL PPO continuous scripts
-    env = gym.wrappers.NormalizeObservation(env)
-    env = gym.wrappers.TransformObservation(env, lambda obs: np.clip(obs, -10, 10))
-
-    env = gym.wrappers.NormalizeReward(env, gamma=0.99)
-    env = gym.wrappers.TransformReward(env, lambda r: float(np.clip(r, -10, 10)))
-
     return env
 
 
@@ -136,15 +128,7 @@ def main():
     load_state_dict_strict(agent, ckpt)
     agent.eval()
 
-    # Optional: warm up normalization statistics a bit (helps if wrappers start “cold”)
-    # Run a few random steps so NormalizeObservation/Reward has sane stats.
-    warm_steps = 200
-    o, _ = env.reset()
-    for _ in range(warm_steps):
-        a = env.action_space.sample()
-        o, _, term, trunc, _ = env.step(a)
-        if term or trunc:
-            o, _ = env.reset()
+
 
     results = []
     for i in range(args.episodes):
