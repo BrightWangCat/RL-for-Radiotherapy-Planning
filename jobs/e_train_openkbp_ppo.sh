@@ -33,13 +33,13 @@ export OPENKBP_ROOT="/fs/scratch/PCON0023/mingshiw/PlanData/open-kbp-opt-data/re
 export OPENKBP_CASE="pt_241"
 export OPENKBP_K="64"
 export OPENKBP_MAX_STEPS="50"
-export OPENKBP_OAR_LAMBDA="0.0"
+export OPENKBP_OAR_LAMBDA="0.005"
 export OPENKBP_STEP_SCALE="0.05"
 export OPENKBP_SEED="0"
 
 python scripts/e_train_openkbp_ppo.py \
   --env-id OpenKBPGrouped-v0 \
-  --total-timesteps 200000 \
+  --total-timesteps 500000 \
   --learning-rate 3e-4 \
   --num-envs 4 \
   --cuda \
