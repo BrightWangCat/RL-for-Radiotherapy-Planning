@@ -86,11 +86,13 @@ class Args:
 
 def make_env(env_id, idx, capture_video, run_name, gamma):
     def thunk():
-        if capture_video and idx == 0:
+        disable_video = env_id.startswith("OpenKBPGrouped")
+        if capture_video and idx == 0 and (not disable_video):
             env = gym.make(env_id, render_mode="rgb_array")
             env = gym.wrappers.RecordVideo(env, f"videos/{run_name}")
         else:
             env = gym.make(env_id)
+
         env = gym.wrappers.FlattenObservation(env)  # deal with dm_control's Dict observation space
         env = gym.wrappers.RecordEpisodeStatistics(env)
         env = gym.wrappers.ClipAction(env)
