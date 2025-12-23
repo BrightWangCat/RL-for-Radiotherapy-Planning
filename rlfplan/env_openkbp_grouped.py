@@ -16,10 +16,12 @@ from rlfplan.openkbp_case import OpenKBPCase
 class GroupedDoseModel:
     B: np.ndarray               # (nV, K) float32 dense
     ptv70_mask: np.ndarray      # (nV,) bool
-    brainstem_mask: Optional[np.ndarray]  # (nV,) bool or None
-    spinalcord_mask: Optional[np.ndarray] # (nV,) bool or None
+    brainstem_mask: Optional[np.ndarray]   # (nV,) bool or None
+    spinalcord_mask: Optional[np.ndarray]  # (nV,) bool or None
     ptv70_ref_mean: float       # float
     gain: float                 # calibration gain applied to B
+    brainstem_ref_mean: float   # reference mean in (possible-dose ∩ structure)
+    spinalcord_ref_mean: float  # reference mean in (possible-dose ∩ structure)
 
 
 class OpenKBPGroupedEnv(gym.Env):
@@ -30,13 +32,15 @@ class OpenKBPGroupedEnv(gym.Env):
     Internal state: s in R^K, constrained s >= 0
     Dose model: dose = B @ s
     Observation: [ptv70_mean, brainstem_mean, spinalcord_mean, step_fraction]
+
     Reward (normalized):
-        - |ptv70_mean - ptv70_ref_mean| / ptv70_ref_mean
-        - oar_lambda * (mean(OAR doses) / ptv70_ref_mean)
+      - PTV: symmetric mean-dose error + extra overdose penalty
+      - OAR: hinge penalty only for exceeding reference-plan OAR mean
+      reward = -err_norm - oar_lambda * oar_pen_norm
 
     Notes:
-      - B is calibrated so that s ~ 1 yields PTV70 mean near reference, which
-        greatly improves learning signal scaling.
+      - B is calibrated so that s ~ 1 yields PTV70 mean near reference.
+      - OAR reference means are computed on the same voxel subset (possible-dose space).
     """
 
     metadata = {"render_modes": []}
@@ -93,7 +97,7 @@ class OpenKBPGroupedEnv(gym.Env):
             c0, c1 = int(edges[g]), int(edges[g + 1])
             if c1 <= c0:
                 continue
-            Bg = Acsc[:, c0:c1].sum(axis=1)  # (nV, 1) matrix
+            Bg = Acsc[:, c0:c1].sum(axis=1)  # (nV, 1)
             B[:, g] = np.asarray(Bg).reshape(-1).astype(np.float32)
 
         # Masks (in possible-dose space)
@@ -112,6 +116,14 @@ class OpenKBPGroupedEnv(gym.Env):
         dose_ref = case.dose_ref
         ptv70_ref_mean = float(dose_ref[ptv70].mean())
 
+        brainstem_ref_mean = 0.0
+        if brainstem is not None:
+            brainstem_ref_mean = float(dose_ref[brainstem].mean())
+
+        spinalcord_ref_mean = 0.0
+        if spinalcord is not None:
+            spinalcord_ref_mean = float(dose_ref[spinalcord].mean())
+
         # ---- Calibration: scale B so that s~=1 yields PTV70 mean near reference ----
         ones = np.ones((K,), dtype=np.float32)
         ptv_mean_per_unit = float((B @ ones)[ptv70].mean())
@@ -127,10 +139,11 @@ class OpenKBPGroupedEnv(gym.Env):
             spinalcord_mask=spinalcord,
             ptv70_ref_mean=ptv70_ref_mean,
             gain=gain,
+            brainstem_ref_mean=brainstem_ref_mean,
+            spinalcord_ref_mean=spinalcord_ref_mean,
         )
 
     def _dose(self) -> np.ndarray:
-        # dose = B @ s
         return self.model.B @ self.s
 
     def _obs_from_dose(self, d: np.ndarray) -> np.ndarray:
@@ -152,7 +165,7 @@ class OpenKBPGroupedEnv(gym.Env):
         if seed is not None:
             self.rng = np.random.default_rng(seed)
 
-        # Adjusted init: start around ~[0.5, 1.0] to match calibrated B scale
+        # Start around ~[0.5, 1.0] so that calibrated B yields reasonable dose magnitudes
         self.s = (0.5 + self.rng.random(self.K, dtype=np.float32) * 0.5).astype(np.float32)
         self.t = 0
 
@@ -160,6 +173,8 @@ class OpenKBPGroupedEnv(gym.Env):
         obs = self._obs_from_dose(d)
         info = {
             "ptv70_ref_mean": self.model.ptv70_ref_mean,
+            "brainstem_ref_mean": self.model.brainstem_ref_mean,
+            "spinalcord_ref_mean": self.model.spinalcord_ref_mean,
             "calibration_gain": self.model.gain,
         }
         return obs, info
@@ -177,14 +192,34 @@ class OpenKBPGroupedEnv(gym.Env):
         ptv70_mean = float(d[self.model.ptv70_mask].mean())
 
         ref = float(self.model.ptv70_ref_mean) + 1e-6
-        err = abs(ptv70_mean - self.model.ptv70_ref_mean) / ref
 
-        oar_pen = 0.0
+        # ---- PTV error (normalized) ----
+        base_err = abs(ptv70_mean - self.model.ptv70_ref_mean) / ref
+
+        # Extra penalty for overdose to suppress PTV overshoot
+        overdose = max(0.0, ptv70_mean - self.model.ptv70_ref_mean) / ref
+
+        # err_norm: symmetric + extra overdose
+        err = float(base_err + overdose)
+
+        # ---- OAR hinge penalty: only punish exceeding reference mean ----
+        bs_mean = 0.0
         if self.model.brainstem_mask is not None:
-            oar_pen += float(d[self.model.brainstem_mask].mean())
+            bs_mean = float(d[self.model.brainstem_mask].mean())
+
+        sc_mean = 0.0
         if self.model.spinalcord_mask is not None:
-            oar_pen += float(d[self.model.spinalcord_mask].mean())
-        oar_pen = oar_pen / ref
+            sc_mean = float(d[self.model.spinalcord_mask].mean())
+
+        bs_excess = 0.0
+        if self.model.brainstem_mask is not None:
+            bs_excess = max(0.0, bs_mean - float(self.model.brainstem_ref_mean))
+
+        sc_excess = 0.0
+        if self.model.spinalcord_mask is not None:
+            sc_excess = max(0.0, sc_mean - float(self.model.spinalcord_ref_mean))
+
+        oar_pen = float((bs_excess + sc_excess) / ref)
 
         reward = -err - self.oar_lambda * oar_pen
 
@@ -198,5 +233,9 @@ class OpenKBPGroupedEnv(gym.Env):
             "err_norm": float(err),
             "oar_pen_norm": float(oar_pen),
             "calibration_gain": self.model.gain,
+            "brainstem_mean": float(bs_mean),
+            "spinalcord_mean": float(sc_mean),
+            "brainstem_ref_mean": float(self.model.brainstem_ref_mean),
+            "spinalcord_ref_mean": float(self.model.spinalcord_ref_mean),
         }
         return obs, float(reward), terminated, truncated, info
