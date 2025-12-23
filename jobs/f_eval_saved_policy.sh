@@ -29,7 +29,6 @@ export OPENKBP_OAR_LAMBDA="0.02"
 export OPENKBP_SEED="0"
 
 python scripts/f_eval_saved_policy.py \
-  #--run-dir "runs/OpenKBPGrouped-v0__ppo_continuous_action__1__1766444090" \
   --run-dir "runs/OpenKBPGrouped-v0__ppo_continuous_action__1__1766458784" \
   --episodes 20 \
   --stochastic
