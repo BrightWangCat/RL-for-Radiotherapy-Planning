@@ -19,13 +19,13 @@ export PYTHONNOUSERSITE=True
 export PYTHONUNBUFFERED=1
 export PYTHONPATH="/fs/scratch/PCON0023/mingshiw/RLfPlan5:${PYTHONPATH:-}"
 
-# Ensure eval uses the same env config as training Run C
+# Ensure eval uses the same env config as training Run A
 export OPENKBP_ROOT="/fs/scratch/PCON0023/mingshiw/PlanData/open-kbp-opt-data/reference-plans"
 export OPENKBP_CASE="pt_241"
 export OPENKBP_K="64"
 export OPENKBP_MAX_STEPS="50"
-export OPENKBP_STEP_SCALE="0.05"
-export OPENKBP_OAR_LAMBDA="0.02"
+export OPENKBP_STEP_SCALE="0.0"
+export OPENKBP_OAR_LAMBDA="0.05"
 export OPENKBP_SEED="0"
 
 python scripts/f_eval_saved_policy.py \

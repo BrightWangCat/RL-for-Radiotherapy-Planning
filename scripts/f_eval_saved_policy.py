@@ -5,31 +5,25 @@ import numpy as np
 import torch
 import gymnasium as gym
 
-# Ensure project + cleanrl import paths
 PROJECT_ROOT = "/fs/scratch/PCON0023/mingshiw/RLfPlan5"
 import sys
 sys.path.insert(0, PROJECT_ROOT)
 sys.path.insert(0, os.path.join(PROJECT_ROOT, "cleanrl"))
 
-import rlfplan.register_envs  # noqa: F401  (registers OpenKBPGrouped-v0)
+import rlfplan.register_envs  # noqa: F401
 
 
-def make_env():
-    """
-    Reproduce the common CleanRL wrappers used in ppo_continuous_action:
-      - RecordEpisodeStatistics
-      - ClipAction
-      - NormalizeObservation + clip
-      - NormalizeReward + clip
-    """
-    env = gym.make("OpenKBPGrouped-v0")
+def make_env_like_cleanrl(env_id: str):
+    # Match your CleanRL thunk() exactly (OpenKBPGrouped path: no Normalize wrappers)
+    env = gym.make(env_id)
+    env = gym.wrappers.FlattenObservation(env)
     env = gym.wrappers.RecordEpisodeStatistics(env)
     env = gym.wrappers.ClipAction(env)
     return env
 
 
 def find_latest_checkpoint(run_dir: str) -> str:
-    pats = ["*.cleanrl_model", "*.pt", "*.pth", "*model*"]
+    pats = ["*.cleanrl_model", "*.pt", "*.pth"]
     cands = []
     for p in pats:
         cands.extend(glob.glob(os.path.join(run_dir, p)))
@@ -42,7 +36,6 @@ def find_latest_checkpoint(run_dir: str) -> str:
 
 
 def torch_load_weights(path: str, device: torch.device):
-    # Avoid the torch FutureWarning when possible (your file is weights only)
     try:
         return torch.load(path, map_location=device, weights_only=True)
     except TypeError:
@@ -51,20 +44,12 @@ def torch_load_weights(path: str, device: torch.device):
 
 def build_agent(envs, device: torch.device):
     import cleanrl.ppo_continuous_action as ppo_mod
-    agent = ppo_mod.Agent(envs).to(device)
-    return agent
-
-
-def load_state_dict_strict(agent: torch.nn.Module, ckpt_obj):
-    if not isinstance(ckpt_obj, dict):
-        raise ValueError(f"Checkpoint is not a dict/state_dict: {type(ckpt_obj)}")
-    # strict=True：不允许静默失败
-    agent.load_state_dict(ckpt_obj, strict=True)
+    return ppo_mod.Agent(envs).to(device)
 
 
 @torch.no_grad()
-def rollout(agent, env, device: torch.device, max_steps: int, deterministic: bool = True):
-    obs, info = env.reset()
+def rollout(agent, env, device, max_steps: int, mode: str, seed: int):
+    obs, info = env.reset(seed=seed)
     ret = 0.0
     err_sum = 0.0
     oar_sum = 0.0
@@ -72,17 +57,20 @@ def rollout(agent, env, device: torch.device, max_steps: int, deterministic: boo
     last_info = {}
 
     for _ in range(max_steps):
-        x = torch.tensor(obs, dtype=torch.float32, device=device).unsqueeze(0)
-
-        if deterministic:
-            # Deterministic action: use actor mean (env has ClipAction wrapper)
-            if not hasattr(agent, "actor_mean"):
-                raise AttributeError("Agent has no attribute 'actor_mean' (unexpected CleanRL version).")
-            action = agent.actor_mean(x)
+        if mode == "random":
+            a = env.action_space.sample()
         else:
-            action, _, _, _ = agent.get_action_and_value(x)
+            x = torch.tensor(obs, dtype=torch.float32, device=device).unsqueeze(0)
 
-        a = action.squeeze(0).detach().cpu().numpy()
+            if mode == "stochastic":
+                action, _, _, _ = agent.get_action_and_value(x)
+                a = action.squeeze(0).cpu().numpy()
+            elif mode == "deterministic":
+                # IMPORTANT: match common tanh-squash continuous PPO implementation
+                mu = agent.actor_mean(x)
+                a = torch.tanh(mu).squeeze(0).cpu().numpy()
+            else:
+                raise ValueError(f"unknown mode: {mode}")
 
         obs, r, term, trunc, step_info = env.step(a)
         ret += float(r)
@@ -94,7 +82,7 @@ def rollout(agent, env, device: torch.device, max_steps: int, deterministic: boo
         if term or trunc:
             break
 
-    out = {
+    return {
         "return": ret,
         "mean_err_norm": err_sum / max(1, steps),
         "mean_oar_norm": oar_sum / max(1, steps),
@@ -102,37 +90,46 @@ def rollout(agent, env, device: torch.device, max_steps: int, deterministic: boo
         "ptv70_mean": float(last_info.get("ptv70_mean", np.nan)),
         "ptv70_ref_mean": float(last_info.get("ptv70_ref_mean", np.nan)),
     }
-    return out
 
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--run-dir", required=True, help="Path to a runs/<run_name> directory")
-    ap.add_argument("--episodes", type=int, default=5)
+    ap.add_argument("--run-dir", required=True)
+    ap.add_argument("--env-id", default="OpenKBPGrouped-v0")
+    ap.add_argument("--episodes", type=int, default=20)
     ap.add_argument("--max-steps", type=int, default=int(os.environ.get("OPENKBP_MAX_STEPS", "50")))
-    ap.add_argument("--stochastic", action="store_true", help="use stochastic actions instead of deterministic mean")
+    ap.add_argument("--seed", type=int, default=0)
+
+    g = ap.add_mutually_exclusive_group()
+    g.add_argument("--stochastic", action="store_true")
+    g.add_argument("--random", action="store_true")
     args = ap.parse_args()
+
+    mode = "deterministic"
+    if args.stochastic:
+        mode = "stochastic"
+    if args.random:
+        mode = "random"
 
     run_dir = args.run_dir.rstrip("/")
     ckpt_path = find_latest_checkpoint(run_dir)
     print("Using checkpoint:", ckpt_path)
+    print("Eval mode:", mode)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    # Build vector env for Agent signature, and a single env for rollout
-    envs = gym.vector.SyncVectorEnv([lambda: make_env()])
-    env = make_env()
+    # Build envs (vector) for Agent signature + single env for rollout
+    envs = gym.vector.SyncVectorEnv([lambda: make_env_like_cleanrl(args.env_id)])
+    env = make_env_like_cleanrl(args.env_id)
 
     agent = build_agent(envs, device)
     ckpt = torch_load_weights(ckpt_path, device)
-    load_state_dict_strict(agent, ckpt)
+    agent.load_state_dict(ckpt, strict=True)
     agent.eval()
-
-
 
     results = []
     for i in range(args.episodes):
-        res = rollout(agent, env, device, args.max_steps, deterministic=(not args.stochastic))
+        res = rollout(agent, env, device, args.max_steps, mode, seed=args.seed + i)
         results.append(res)
         print(
             f"[ep {i+1:02d}] return={res['return']:.4f} "
