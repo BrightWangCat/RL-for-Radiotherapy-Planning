@@ -30,4 +30,5 @@ export OPENKBP_SEED="0"
 
 python scripts/f_eval_saved_policy.py \
   --run-dir "runs/OpenKBPGrouped-v0__ppo_continuous_action__1__1766444090" \
-  --episodes 5
+  --episodes 20 \
+  --stochastic
