@@ -412,6 +412,11 @@ def main():
             writer.add_scalar("val/avg_mean_oar_norm", val["avg_mean_oar_norm"], global_step)
 
             # Track best
+            print(
+                f"[VAL] avg_return={val['avg_return']:.6f} "
+                f"err={val['avg_mean_err_norm']:.6f} oar={val['avg_mean_oar_norm']:.6f} "
+                f"episodes={int(val['episodes'])}"
+            )
             if val["avg_return"] > best_val_return:
                 best_val_return = val["avg_return"]
                 if args.save_model:
