@@ -1,6 +1,9 @@
+# scripts/f_eval_saved_policy_vmat2d.py
 import os
 import glob
 import argparse
+from typing import List, Optional
+
 import numpy as np
 import torch
 import gymnasium as gym
@@ -11,17 +14,11 @@ sys.path.insert(0, PROJECT_ROOT)
 sys.path.insert(0, os.path.join(PROJECT_ROOT, "cleanrl"))
 
 import rlfplan.register_envs  # noqa: F401
-from cleanrl.ppo_discrete_cnn_vmat2d import Agent
-
-
-def make_env(env_id: str):
-    env = gym.make(env_id)
-    env = gym.wrappers.RecordEpisodeStatistics(env)
-    return env
+from rlfplan.wrappers.case_sampler import load_case_list
 
 
 def find_latest_checkpoint(run_dir: str) -> str:
-    pats = ["*.cleanrl_model", "*.pt", "*.pth"]
+    pats = ["model_best.cleanrl_model", "model_last.cleanrl_model", "model.cleanrl_model", "*.cleanrl_model", "*.pt", "*.pth"]
     cands = []
     for p in pats:
         cands.extend(glob.glob(os.path.join(run_dir, p)))
@@ -33,9 +30,49 @@ def find_latest_checkpoint(run_dir: str) -> str:
     return cands[0]
 
 
+class Agent(torch.nn.Module):
+    def __init__(self, n_actions: int):
+        super().__init__()
+        self.network = torch.nn.Sequential(
+            torch.nn.Conv2d(2, 32, 8, stride=4),
+            torch.nn.ReLU(),
+            torch.nn.Conv2d(32, 64, 4, stride=2),
+            torch.nn.ReLU(),
+            torch.nn.Conv2d(64, 64, 3, stride=1),
+            torch.nn.ReLU(),
+            torch.nn.Flatten(),
+        )
+        with torch.no_grad():
+            dummy = torch.zeros((1, 2, 96, 96), dtype=torch.float32)
+            n_flat = self.network(dummy).shape[1]
+
+        self.actor = torch.nn.Sequential(
+            torch.nn.Linear(n_flat, 512),
+            torch.nn.ReLU(),
+            torch.nn.Linear(512, n_actions),
+        )
+        self.critic = torch.nn.Sequential(
+            torch.nn.Linear(n_flat, 512),
+            torch.nn.ReLU(),
+            torch.nn.Linear(512, 1),
+        )
+
+    def _preprocess(self, x: torch.Tensor) -> torch.Tensor:
+        x = x.permute(0, 3, 1, 2).contiguous()
+        return x.float() / 255.0
+
+    def forward_logits(self, obs_uint8: torch.Tensor) -> torch.Tensor:
+        x = self._preprocess(obs_uint8)
+        h = self.network(x)
+        return self.actor(h)
+
+
 @torch.no_grad()
-def rollout(agent, env, device, max_steps: int, mode: str, seed: int):
-    obs, info = env.reset(seed=seed)
+def rollout(env: gym.Env, agent: Agent, device: torch.device,
+            mode: str, max_steps: int, seed: int, case_id: Optional[str] = None):
+    options = {"case_id": case_id} if case_id else None
+    obs, info = env.reset(seed=seed, options=options)
+
     ret = 0.0
     err_sum = 0.0
     oar_sum = 0.0
@@ -46,15 +83,16 @@ def rollout(agent, env, device, max_steps: int, mode: str, seed: int):
         if mode == "random":
             a = env.action_space.sample()
         else:
-            x = torch.tensor(obs, dtype=torch.uint8, device=device).unsqueeze(0)  # (1,96,96,2)
-            logits, _ = agent.forward(x)
+            x = torch.tensor(obs, dtype=torch.uint8, device=device).unsqueeze(0)
+            logits = agent.forward_logits(x)
+            dist = torch.distributions.Categorical(logits=logits)
+
             if mode == "stochastic":
-                dist = torch.distributions.Categorical(logits=logits)
                 a = int(dist.sample().item())
             elif mode == "deterministic":
-                a = int(torch.argmax(logits, dim=-1).item())
+                a = int(torch.argmax(logits, dim=1).item())
             else:
-                raise ValueError(mode)
+                raise ValueError(f"unknown mode: {mode}")
 
         obs, r, term, trunc, step_info = env.step(a)
         ret += float(r)
@@ -62,6 +100,7 @@ def rollout(agent, env, device, max_steps: int, mode: str, seed: int):
         oar_sum += float(step_info.get("oar_pen_norm", 0.0))
         steps += 1
         last_info = step_info
+
         if term or trunc:
             break
 
@@ -72,61 +111,84 @@ def rollout(agent, env, device, max_steps: int, mode: str, seed: int):
         "steps": steps,
         "ptv70_mean": float(last_info.get("ptv70_mean", np.nan)),
         "ptv70_ref_mean": float(last_info.get("ptv70_ref_mean", np.nan)),
+        "case_id": case_id or str(info.get("case_id", "")),
     }
 
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--run-dir", required=True)
-    ap.add_argument("--env-id", default="OpenKBPVMAT2D-v0")
+    ap.add_argument("--run-dir", type=str, required=True)
+    ap.add_argument("--env-id", type=str, default="OpenKBPVMAT2D-v0")
     ap.add_argument("--episodes", type=int, default=20)
-    ap.add_argument("--max-steps", type=int, default=int(os.environ.get("OPENKBP_MAX_STEPS", "192")))
+    ap.add_argument("--max-steps", type=int, default=192)
     ap.add_argument("--seed", type=int, default=0)
 
-    g = ap.add_mutually_exclusive_group()
-    g.add_argument("--stochastic", action="store_true")
-    g.add_argument("--random", action="store_true")
+    ap.add_argument("--stochastic", action="store_true")
+    ap.add_argument("--random", action="store_true")
+
+    ap.add_argument("--cases-file", type=str, default="")
+    ap.add_argument("--episodes-per-case", type=int, default=1)
+
+    ap.add_argument("--cpu", action="store_true")
     args = ap.parse_args()
 
     mode = "deterministic"
-    if args.stochastic:
-        mode = "stochastic"
     if args.random:
         mode = "random"
+    elif args.stochastic:
+        mode = "stochastic"
 
-    run_dir = args.run_dir.rstrip("/")
-    ckpt_path = find_latest_checkpoint(run_dir)
-    print("Using checkpoint:", ckpt_path)
-    print("Eval mode:", mode)
+    device = torch.device("cpu" if args.cpu or (not torch.cuda.is_available()) else "cuda")
 
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    ckpt = find_latest_checkpoint(args.run_dir)
+    print(f"Using checkpoint: {ckpt}")
+    print(f"Eval mode: {mode}")
 
-    # Build agent
-    agent = Agent(n_actions=15).to(device)
-    ckpt = torch.load(ckpt_path, map_location=device)
-    agent.load_state_dict(ckpt, strict=True)
+    # Build env
+    if args.cases_file:
+        case_ids = load_case_list(args.cases_file)
+        # ensure env can init
+        if not os.environ.get("OPENKBP_CASE"):
+            os.environ["OPENKBP_CASE"] = str(case_ids[0])
+    else:
+        case_ids = []
+
+    env = gym.make(args.env_id)
+    env = gym.wrappers.RecordEpisodeStatistics(env)
+
+    n_actions = env.action_space.n
+    agent = Agent(n_actions=n_actions).to(device)
+    agent.load_state_dict(torch.load(ckpt, map_location=device))
     agent.eval()
 
-    env = make_env(args.env_id)
+    metrics = []
+    if case_ids:
+        for cid in case_ids:
+            for i in range(args.episodes_per_case):
+                m = rollout(env, agent, device, mode, args.max_steps, args.seed + 1000 * i, case_id=cid)
+                metrics.append(m)
+    else:
+        for i in range(args.episodes):
+            m = rollout(env, agent, device, mode, args.max_steps, args.seed + 1000 * i, case_id=None)
+            metrics.append(m)
 
-    results = []
-    for i in range(args.episodes):
-        res = rollout(agent, env, device, args.max_steps, mode, seed=args.seed + i)
-        results.append(res)
-        print(
-            f"[ep {i+1:02d}] return={res['return']:.4f} "
-            f"mean_err_norm={res['mean_err_norm']:.4f} mean_oar_norm={res['mean_oar_norm']:.4f} "
-            f"ptv70_mean={res['ptv70_mean']:.3f} ref={res['ptv70_ref_mean']:.3f}"
-        )
+    env.close()
 
-    def mean(k): return float(np.mean([r[k] for r in results]))
-    print("\n=== SUMMARY ===")
-    print("episodes:", args.episodes)
-    print("avg_return:", mean("return"))
-    print("avg_mean_err_norm:", mean("mean_err_norm"))
-    print("avg_mean_oar_norm:", mean("mean_oar_norm"))
-    print("avg_ptv70_mean:", mean("ptv70_mean"))
-    print("avg_ptv70_ref_mean:", mean("ptv70_ref_mean"))
+    rets = [m["return"] for m in metrics]
+    err = [m["mean_err_norm"] for m in metrics]
+    oar = [m["mean_oar_norm"] for m in metrics]
+    ptv = [m["ptv70_mean"] for m in metrics if np.isfinite(m["ptv70_mean"])]
+    ptvref = [m["ptv70_ref_mean"] for m in metrics if np.isfinite(m["ptv70_ref_mean"])]
+
+    print("=== SUMMARY ===")
+    print(f"episodes: {len(metrics)}")
+    print(f"avg_return: {float(np.mean(rets))}")
+    print(f"avg_mean_err_norm: {float(np.mean(err))}")
+    print(f"avg_mean_oar_norm: {float(np.mean(oar))}")
+    if ptv:
+        print(f"avg_ptv70_mean: {float(np.mean(ptv))}")
+    if ptvref:
+        print(f"avg_ptv70_ref_mean: {float(np.mean(ptvref))}")
 
 
 if __name__ == "__main__":
