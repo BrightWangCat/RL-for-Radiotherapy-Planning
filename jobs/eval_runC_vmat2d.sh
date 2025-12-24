@@ -35,7 +35,7 @@ export OPENKBP_INIT_D0="100"
 export OPENKBP_INIT_LEAF_HALF_WIDTH="8"
 
 # 改成你实际训练产生的 runs 目录
-RUN_DIR="runs/OpenKBPVMAT2D-v0__ppo_discrete_cnn__0__XXXXXXXXXX"
+RUN_DIR="runs/OpenKBPVMAT2D-v0__ppo_discrete_cnn__0__1766550411"
 
 echo "=== deterministic ==="
 python scripts/f_eval_saved_policy_vmat2d.py --run-dir "${RUN_DIR}" --env-id OpenKBPVMAT2D-v0 --episodes 20
