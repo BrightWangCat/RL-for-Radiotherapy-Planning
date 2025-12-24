@@ -28,6 +28,7 @@ export OPENKBP_MAX_STEPS="50"
 export OPENKBP_STEP_SCALE="0.05"
 export OPENKBP_OAR_LAMBDA="0.02"
 export OPENKBP_SEED="0"
+export OPENKBP_ACTION_LAMBDA="0.02"
 
 python scripts/e_train_openkbp_ppo.py \
   --env-id OpenKBPGrouped-v0 \

@@ -115,6 +115,7 @@ def _make_openkbp_vmat2d_env():
     init_d0 = _getenv_int("OPENKBP_INIT_D0", 100)
     init_leaf_half_width = _getenv_int("OPENKBP_INIT_LEAF_HALF_WIDTH", 8)
     calibrate_init = _getenv_bool("OPENKBP_CALIBRATE_INIT", True)
+    action_lambda = _getenv_float("OPENKBP_ACTION_LAMBDA", 0.02)
 
     # Build kwargs based on actual env signature (avoids mismatch across your iterations)
     sig = inspect.signature(OpenKBPVMAT2DEnv.__init__)
@@ -135,6 +136,8 @@ def _make_openkbp_vmat2d_env():
         kwargs["oar_lambda"] = oar_lambda
     if "seed" in params:
         kwargs["seed"] = seed
+    if "action_lambda" in params:
+        kwargs["action_lambda"] = action_lambda
 
     # init knobs (choose supported names)
     if "init_d0" in params:

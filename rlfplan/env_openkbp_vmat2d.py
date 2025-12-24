@@ -82,6 +82,7 @@ class OpenKBPVMAT2DEnv(gym.Env):
         n_cps: int = 96,
         max_steps: int = 192,
         oar_lambda: float = 0.02,
+        action_lambda: float = 0.02,
         seed: int = 0,
         d0_min: int = 20,
         d0_max: int = 600,
@@ -111,6 +112,7 @@ class OpenKBPVMAT2DEnv(gym.Env):
         self.n_cps = int(n_cps)
         self.max_steps = int(max_steps)
         self.oar_lambda = float(oar_lambda)
+        self.action_lambda = float(action_lambda)
 
         self.base_seed = int(seed)
         self.rng = np.random.default_rng(self.base_seed)
@@ -546,7 +548,8 @@ class OpenKBPVMAT2DEnv(gym.Env):
 
         oar_pen = float((bs_excess + sc_excess) / ref)
 
-        reward = -err - self.oar_lambda * oar_pen
+        action_cost = 0.0 if a == 0 else 1.0
+        reward = -err - self.oar_lambda * oar_pen - self.action_lambda * action_cost
 
         terminated = (err < 0.05) and (oar_pen < 0.05)
         truncated = (self.t >= self.max_steps)
@@ -584,6 +587,8 @@ class OpenKBPVMAT2DEnv(gym.Env):
             "err_norm": float(err),
             "oar_pen_norm": float(oar_pen),
             "calibration_gain": float(self.model.gain),
+            "action_cost": float(action_cost),
+            "action_lambda": float(self.action_lambda),
         }
 
         return obs, float(reward), bool(terminated), bool(truncated), info

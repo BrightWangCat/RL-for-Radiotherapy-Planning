@@ -27,6 +27,7 @@ export OPENKBP_MAX_STEPS="192"
 export OPENKBP_OAR_LAMBDA="0.02"
 export OPENKBP_SEED="0"
 
+export OPENKBP_ACTION_LAMBDA="0.02"
 # Optional init knobs
 export OPENKBP_INIT_D0="100"
 export OPENKBP_INIT_LEAF_HALF_WIDTH="8" 
