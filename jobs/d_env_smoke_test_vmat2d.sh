@@ -1,7 +1,7 @@
 #!/bin/bash
 #SBATCH --account=PCON0023
 #SBATCH --partition=nextgen
-#SBATCH --job-name=kbp_env_smoke
+#SBATCH --job-name=kbp_env_smoke_vmat2d
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=4
