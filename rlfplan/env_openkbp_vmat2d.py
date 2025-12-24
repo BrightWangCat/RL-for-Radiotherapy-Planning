@@ -56,32 +56,18 @@ class GroupedDoseModel:
 
 class OpenKBPVMAT2DEnv(gym.Env):
     """
-    Paper-aligned IO (approximate VMAT dynamics):
+    Paper-aligned IO (approximate VMAT dynamics) + fast incremental dose cache.
 
-      Observation: uint8 image of shape (96, 96, 2)
-        - Frame 1: (normalized dose - objective map) rotated by -theta
-        - Frame 2: sinogram of machine params (d0, x1, x2), y-axis relative theta
+    Observation: uint8 (96,96,2)
+      - frame1: (normalized dose - objective map) rotated by -theta
+      - frame2: machine parameter sinogram
 
-      Action: Discrete(15) exactly matching paper Table I:
-        leaf1 x1: +/-5 mm or 0
-        leaf2 x2: +/-5 mm or 0
-        dose rate d0: +/-20 or 0 (percent of baseline)
+    Action: Discrete(15) exactly Table I in paper
+    Gantry increment: 3.75° => 96 control points
 
-      Gantry: fixed increment 3.75 degrees => 96 control points per full arc.
-
-    Approximation note:
-      - Uses grouped dose model B from possible-dose space.
-      - Leaf positions open a contiguous window over a heuristic-ordered group axis.
-      - Dose rate scales contribution at each control point.
-      - Dose computed from full plan by averaging control-point masks ("replacement style").
-
-    Termination:
-      - early stop when (err_norm < 0.05) and (oar_pen_norm < 0.05)
-      - truncated at max_steps (default 192 for 2 arcs)
-
-    IMPORTANT practical setting:
-      - `calibrate_init=True` will scale the baseline weights `s0` so that
-        reset() starts near PTV70 mean reference (paper-like "conformal start").
+    Performance note:
+      - We maintain per-control-point mask & scale caches and a running sum over CPs.
+      - Each step updates only the modified CP contribution (O(K) instead of O(n_cps*K)).
     """
 
     metadata = {"render_modes": []}
@@ -97,14 +83,11 @@ class OpenKBPVMAT2DEnv(gym.Env):
         max_steps: int = 192,
         oar_lambda: float = 0.02,
         seed: int = 0,
-        # machine constraints (paper-like)
         d0_min: int = 20,
         d0_max: int = 600,
         leaf_step_mm: int = 5,
-        # initialization
         init_leaf_half_width: int = 8,
         init_d0: int = 100,
-        # NEW: conformal-like initialization (recommended)
         calibrate_init: bool = True,
         init_scale_clip: Tuple[float, float] = (0.2, 6.0),
     ):
@@ -119,8 +102,6 @@ class OpenKBPVMAT2DEnv(gym.Env):
             case = OpenKBPCase.load(self.root, self.case_id)
 
         self.case: OpenKBPCase = case
-
-        # If case_id wasn't provided, try to infer a stable identifier
         if not self.case_id:
             inferred = getattr(case, "case_id", None) or getattr(case, "patient_id", None)
             if inferred is not None:
@@ -150,7 +131,7 @@ class OpenKBPVMAT2DEnv(gym.Env):
         self.action_space = spaces.Discrete(15)
         self.observation_space = spaces.Box(low=0, high=255, shape=(96, 96, 2), dtype=np.uint8)
 
-        # plan state across control points
+        # plan state across CPs (stored in ordered-axis indices)
         self.x1_idx = np.zeros((self.n_cps,), dtype=np.int32)
         self.x2_idx = np.zeros((self.n_cps,), dtype=np.int32)
         self.d0 = np.zeros((self.n_cps,), dtype=np.int32)
@@ -165,8 +146,16 @@ class OpenKBPVMAT2DEnv(gym.Env):
         # objective vector in possible-dose space
         self._obj_vec = self._build_objective_vec()
 
-        # stable image mapping (possible-dose -> 96x96)
+        # stable 96x96 index map
         self._img_index_map = self._build_img_index_map()
+
+        # --- fast dose caches ---
+        # mask_cp: (n_cps, K) float32 0/1 in ORIGINAL group index space
+        # scale_cp: (n_cps,) float32 = d0/100
+        # sum_masked: (K,) float32 = sum_cp( mask_cp[cp] * scale_cp[cp] )
+        self._mask_cp = np.zeros((self.n_cps, self.K), dtype=np.float32)
+        self._scale_cp = np.zeros((self.n_cps,), dtype=np.float32)
+        self._sum_masked = np.zeros((self.K,), dtype=np.float32)
 
     # -------------------- model + objectives --------------------
     @staticmethod
@@ -178,14 +167,14 @@ class OpenKBPVMAT2DEnv(gym.Env):
             raise ValueError("K must be >= 1")
 
         edges = np.linspace(0, nB, K + 1, dtype=np.int32)
-
         B = np.zeros((nV, K), dtype=np.float32)
+
         Acsc = A.tocsc()
         for g in range(K):
             c0, c1 = int(edges[g]), int(edges[g + 1])
             if c1 <= c0:
                 continue
-            Bg = Acsc[:, c0:c1].sum(axis=1)  # (nV, 1)
+            Bg = Acsc[:, c0:c1].sum(axis=1)
             B[:, g] = np.asarray(Bg).reshape(-1).astype(np.float32)
 
         ptv70 = case.struct_masks.get("PTV70", None)
@@ -203,15 +192,10 @@ class OpenKBPVMAT2DEnv(gym.Env):
         dose_ref = case.dose_ref
         ptv70_ref_mean = float(dose_ref[ptv70].mean())
 
-        brainstem_ref_mean = 0.0
-        if brainstem is not None:
-            brainstem_ref_mean = float(dose_ref[brainstem].mean())
+        brainstem_ref_mean = float(dose_ref[brainstem].mean()) if brainstem is not None else 0.0
+        spinalcord_ref_mean = float(dose_ref[spinalcord].mean()) if spinalcord is not None else 0.0
 
-        spinalcord_ref_mean = 0.0
-        if spinalcord is not None:
-            spinalcord_ref_mean = float(dose_ref[spinalcord].mean())
-
-        # Calibration so that s~=1 yields PTV70 mean near reference (when fully open)
+        # Calibration so that s~=1 yields PTV70 mean near reference when fully open
         ones = np.ones((K,), dtype=np.float32)
         ptv_mean_per_unit = float((B @ ones)[ptv70].mean())
         if ptv_mean_per_unit <= 1e-8:
@@ -252,10 +236,7 @@ class OpenKBPVMAT2DEnv(gym.Env):
         nV = int(self.model.B.shape[0])
         obj = np.zeros((nV,), dtype=np.float32)
 
-        # PTV objective
         obj[self.model.ptv70_mask] = np.float32(self.model.ptv70_ref_mean)
-
-        # OAR objectives (mean-based proxy)
         if self.model.brainstem_mask is not None:
             obj[self.model.brainstem_mask] = np.float32(self.model.brainstem_ref_mean)
         if self.model.spinalcord_mask is not None:
@@ -303,33 +284,41 @@ class OpenKBPVMAT2DEnv(gym.Env):
             raise ValueError(f"Expected v size {int(self.model.B.shape[0])}, got {v.size}")
         if self._img_index_map is None or self._img_index_map.size != 96 * 96:
             self._img_index_map = self._build_img_index_map()
-        idx = self._img_index_map
-        return v[idx].reshape(96, 96)
+        return v[self._img_index_map].reshape(96, 96)
 
-    # -------------------- plan -> dose --------------------
-    def _aperture_mask_for_cp(self, cp: int) -> np.ndarray:
-        x1 = int(self.x1_idx[cp])
-        x2 = int(self.x2_idx[cp])
-
+    # -------------------- aperture mask helper (ordered axis -> original group index) --------------------
+    def _mask_from_x1x2(self, x1: int, x2: int) -> np.ndarray:
         x1 = int(np.clip(x1, 0, self.K - 2))
         x2 = int(np.clip(x2, x1 + 1, self.K - 1))
 
-        win = np.zeros((self.K,), dtype=np.float32)
-        ordered_positions = np.arange(self.K, dtype=np.int32)
-        open_pos = ordered_positions[x1 : x2 + 1]
+        # window positions in ordered axis
+        open_pos = np.arange(x1, x2 + 1, dtype=np.int32)
+        # map to original group indices
         open_group_indices = self.model.order[open_pos]
-        win[open_group_indices] = 1.0
-        return win
 
+        m = np.zeros((self.K,), dtype=np.float32)
+        m[open_group_indices] = 1.0
+        return m
+
+    # -------------------- fast cache rebuild --------------------
+    def _rebuild_plan_cache(self):
+        self._scale_cp[:] = (self.d0.astype(np.float32) / 100.0)
+        # if all CP share same x1/x2, build one mask and broadcast
+        if np.all(self.x1_idx == self.x1_idx[0]) and np.all(self.x2_idx == self.x2_idx[0]):
+            m = self._mask_from_x1x2(int(self.x1_idx[0]), int(self.x2_idx[0]))
+            self._mask_cp[:] = m[None, :]
+            self._sum_masked[:] = m * float(self._scale_cp.sum())
+        else:
+            self._sum_masked[:] = 0.0
+            for cp in range(self.n_cps):
+                m = self._mask_from_x1x2(int(self.x1_idx[cp]), int(self.x2_idx[cp]))
+                self._mask_cp[cp] = m
+                self._sum_masked += m * float(self._scale_cp[cp])
+
+    # -------------------- plan -> dose (fast) --------------------
     def _effective_weights(self) -> np.ndarray:
-        w = np.zeros((self.K,), dtype=np.float32)
-        for cp in range(self.n_cps):
-            m = self._aperture_mask_for_cp(cp)
-            scale = float(self.d0[cp]) / 100.0
-            w += (m * np.float32(scale))
-        w /= float(self.n_cps)
-        w *= self.s0
-        return w
+        # mean over CPs, then apply s0
+        return (self._sum_masked / float(self.n_cps)) * self.s0
 
     def _dose(self) -> np.ndarray:
         w = self._effective_weights()
@@ -395,21 +384,16 @@ class OpenKBPVMAT2DEnv(gym.Env):
 
     # -------------------- reset init calibration --------------------
     def _calibrate_init_to_ptv(self) -> Dict[str, float]:
-        """
-        Scale s0 so that current plan PTV70 mean matches reference (within clip bounds).
-        Returns diagnostic info.
-        """
         dose0 = self._dose()
         ptv_mean0 = float(dose0[self.model.ptv70_mask].mean())
         ref = float(self.model.ptv70_ref_mean)
 
         eps = 1e-6
         scale = ref / max(ptv_mean0, eps)
-
         lo, hi = self.init_scale_clip
-        scale_clipped = float(np.clip(scale, lo, hi))
+        scale_applied = float(np.clip(scale, lo, hi))
 
-        self.s0 *= np.float32(scale_clipped)
+        self.s0 *= np.float32(scale_applied)
 
         dose1 = self._dose()
         ptv_mean1 = float(dose1[self.model.ptv70_mask].mean())
@@ -418,7 +402,7 @@ class OpenKBPVMAT2DEnv(gym.Env):
             "init_ptv_mean_before": ptv_mean0,
             "init_ptv_mean_after": ptv_mean1,
             "init_scale_raw": float(scale),
-            "init_scale_applied": float(scale_clipped),
+            "init_scale_applied": float(scale_applied),
         }
 
     # -------------------- Gym API --------------------
@@ -441,7 +425,7 @@ class OpenKBPVMAT2DEnv(gym.Env):
             self._obj_vec = self._build_objective_vec()
             self._img_index_map = self._build_img_index_map()
 
-        # base weights around [0.5, 1.0]
+        # random base weights around [0.5, 1.0]
         self.s0 = (0.5 + self.rng.random(self.K, dtype=np.float32) * 0.5).astype(np.float32)
 
         # Initialize plan: centered window + constant d0
@@ -455,6 +439,9 @@ class OpenKBPVMAT2DEnv(gym.Env):
 
         self.t = 0
         self.cp_idx = 0
+
+        # build fast caches for this baseline plan
+        self._rebuild_plan_cache()
 
         calib_info = {}
         if self.calibrate_init:
@@ -472,17 +459,13 @@ class OpenKBPVMAT2DEnv(gym.Env):
             "cp_idx": int(self.cp_idx),
             "theta_deg": 0.0,
 
-            # plan params at reset
             "cp_applied": int(self.cp_idx),
             "theta_applied_deg": 0.0,
             "d0": int(self.d0[self.cp_idx]),
             "x1_mm": int(self.x1_idx[self.cp_idx]) * self.leaf_step_mm,
             "x2_mm": int(self.x2_idx[self.cp_idx]) * self.leaf_step_mm,
 
-            # dose diagnostics at reset
             "ptv70_mean": float(dose[self.model.ptv70_mask].mean()),
-
-            # init calibration diagnostics
             **calib_info,
         }
         return obs, info
@@ -500,6 +483,11 @@ class OpenKBPVMAT2DEnv(gym.Env):
         cp_applied = int(self.cp_idx)
         theta_applied_deg = float(cp_applied) * (360.0 / float(self.n_cps))
 
+        # old contribution for incremental update
+        old_scale = float(self._scale_cp[cp_applied])
+        old_mask = self._mask_cp[cp_applied]  # view
+        old_term = old_mask * np.float32(old_scale)
+
         dx1 = int(round(dx1_mm / float(self.leaf_step_mm)))
         dx2 = int(round(dx2_mm / float(self.leaf_step_mm)))
 
@@ -514,7 +502,19 @@ class OpenKBPVMAT2DEnv(gym.Env):
         if self.x2_idx[cp_applied] <= self.x1_idx[cp_applied]:
             self.x2_idx[cp_applied] = int(np.clip(self.x1_idx[cp_applied] + 1, 1, self.K - 1))
 
-        # snapshot applied values (correct logging)
+        # new mask & scale
+        new_scale = float(self.d0[cp_applied]) / 100.0
+        new_mask = self._mask_from_x1x2(int(self.x1_idx[cp_applied]), int(self.x2_idx[cp_applied]))
+        new_term = new_mask * np.float32(new_scale)
+
+        # write caches
+        self._scale_cp[cp_applied] = np.float32(new_scale)
+        self._mask_cp[cp_applied] = new_mask
+
+        # incremental update of sum_masked
+        self._sum_masked += (new_term - old_term)
+
+        # snapshot applied values for logging
         d0_applied = int(self.d0[cp_applied])
         x1_applied_mm = int(self.x1_idx[cp_applied]) * self.leaf_step_mm
         x2_applied_mm = int(self.x2_idx[cp_applied]) * self.leaf_step_mm
@@ -530,34 +530,22 @@ class OpenKBPVMAT2DEnv(gym.Env):
 
         dose = self._dose()
 
-        # --- metrics (mean-based proxy) ---
+        # metrics (mean-based proxy)
         ptv70_mean = float(dose[self.model.ptv70_mask].mean())
         ref = float(self.model.ptv70_ref_mean) + 1e-6
 
-        # symmetric under/over, with extra overdose penalty
         base_err = abs(ptv70_mean - float(self.model.ptv70_ref_mean)) / ref
         overdose = max(0.0, ptv70_mean - float(self.model.ptv70_ref_mean)) / ref
         err = float(base_err + overdose)
 
-        bs_mean = 0.0
-        if self.model.brainstem_mask is not None:
-            bs_mean = float(dose[self.model.brainstem_mask].mean())
+        bs_mean = float(dose[self.model.brainstem_mask].mean()) if self.model.brainstem_mask is not None else 0.0
+        sc_mean = float(dose[self.model.spinalcord_mask].mean()) if self.model.spinalcord_mask is not None else 0.0
 
-        sc_mean = 0.0
-        if self.model.spinalcord_mask is not None:
-            sc_mean = float(dose[self.model.spinalcord_mask].mean())
-
-        bs_excess = 0.0
-        if self.model.brainstem_mask is not None:
-            bs_excess = max(0.0, bs_mean - float(self.model.brainstem_ref_mean))
-
-        sc_excess = 0.0
-        if self.model.spinalcord_mask is not None:
-            sc_excess = max(0.0, sc_mean - float(self.model.spinalcord_ref_mean))
+        bs_excess = max(0.0, bs_mean - float(self.model.brainstem_ref_mean)) if self.model.brainstem_mask is not None else 0.0
+        sc_excess = max(0.0, sc_mean - float(self.model.spinalcord_ref_mean)) if self.model.spinalcord_mask is not None else 0.0
 
         oar_pen = float((bs_excess + sc_excess) / ref)
 
-        # PPO reward (maximize) = negative cost
         reward = -err - self.oar_lambda * oar_pen
 
         terminated = (err < 0.05) and (oar_pen < 0.05)
@@ -568,11 +556,9 @@ class OpenKBPVMAT2DEnv(gym.Env):
         info: Dict[str, Any] = {
             "case_id": self.case_id,
 
-            # current cp after advance
             "cp_idx": int(self.cp_idx),
             "theta_deg": float(theta_deg),
 
-            # action applied to which cp
             "cp_applied": int(cp_applied),
             "theta_applied_deg": float(theta_applied_deg),
             "action_index": int(a),
@@ -580,12 +566,11 @@ class OpenKBPVMAT2DEnv(gym.Env):
             "dx2_mm": int(dx2_mm),
             "dd0": int(dd0),
 
-            # legacy keys reflect APPLIED values (so your logging shows changes)
+            # legacy keys reflect APPLIED values
             "d0": int(d0_applied),
             "x1_mm": int(x1_applied_mm),
             "x2_mm": int(x2_applied_mm),
 
-            # next cp values for reference
             "d0_next": int(d0_next),
             "x1_next_mm": int(x1_next_mm),
             "x2_next_mm": int(x2_next_mm),
