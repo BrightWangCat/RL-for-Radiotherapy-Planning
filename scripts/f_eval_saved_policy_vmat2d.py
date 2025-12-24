@@ -18,21 +18,12 @@ from rlfplan.wrappers.case_sampler import load_case_list
 
 
 def pick_checkpoint(run_dir: str) -> str:
-    """
-    Deterministic priority (do NOT depend on mtime):
-      1) model_best.cleanrl_model
-      2) model_last.cleanrl_model
-      3) model.cleanrl_model
-      4) any *.cleanrl_model / *.pt / *.pth (newest)
-    """
     p_best = os.path.join(run_dir, "model_best.cleanrl_model")
     if os.path.isfile(p_best):
         return p_best
-
     p_last = os.path.join(run_dir, "model_last.cleanrl_model")
     if os.path.isfile(p_last):
         return p_last
-
     p_compat = os.path.join(run_dir, "model.cleanrl_model")
     if os.path.isfile(p_compat):
         return p_compat
@@ -47,6 +38,13 @@ def pick_checkpoint(run_dir: str) -> str:
         raise FileNotFoundError(f"No checkpoint found under {run_dir}")
     cands.sort(key=lambda x: os.path.getmtime(x), reverse=True)
     return cands[0]
+
+
+def safe_torch_load(path: str, device: torch.device):
+    try:
+        return torch.load(path, map_location=device, weights_only=True)
+    except TypeError:
+        return torch.load(path, map_location=device)
 
 
 class Agent(torch.nn.Module):
@@ -64,7 +62,6 @@ class Agent(torch.nn.Module):
         with torch.no_grad():
             dummy = torch.zeros((1, 2, 96, 96), dtype=torch.float32)
             n_flat = self.network(dummy).shape[1]
-
         self.actor = torch.nn.Sequential(
             torch.nn.Linear(n_flat, 512),
             torch.nn.ReLU(),
@@ -82,8 +79,16 @@ class Agent(torch.nn.Module):
 
 
 @torch.no_grad()
-def rollout(env: gym.Env, agent: Agent, device: torch.device,
-            mode: str, max_steps: int, seed: int, case_id: Optional[str] = None):
+def rollout(
+    env: gym.Env,
+    agent: Optional[Agent],
+    device: torch.device,
+    mode: str,
+    max_steps: int,
+    seed: int,
+    case_id: Optional[str] = None,
+    fixed_action: Optional[int] = None,
+):
     options = {"case_id": case_id} if case_id else None
     obs, info = env.reset(seed=seed, options=options)
 
@@ -94,13 +99,15 @@ def rollout(env: gym.Env, agent: Agent, device: torch.device,
     last_info = {}
 
     for _ in range(max_steps):
-        if mode == "random":
+        if fixed_action is not None:
+            a = int(fixed_action)
+        elif mode == "random":
             a = env.action_space.sample()
         else:
+            assert agent is not None
             x = torch.tensor(obs, dtype=torch.uint8, device=device).unsqueeze(0)
             logits = agent.forward_logits(x)
             dist = torch.distributions.Categorical(logits=logits)
-
             if mode == "stochastic":
                 a = int(dist.sample().item())
             elif mode == "deterministic":
@@ -139,6 +146,7 @@ def main():
 
     ap.add_argument("--stochastic", action="store_true")
     ap.add_argument("--random", action="store_true")
+    ap.add_argument("--fixed-action", type=int, default=None, help="If set, always take this action id.")
 
     ap.add_argument("--cases-file", type=str, default="")
     ap.add_argument("--episodes-per-case", type=int, default=1)
@@ -146,18 +154,18 @@ def main():
     ap.add_argument("--cpu", action="store_true")
     args = ap.parse_args()
 
+    # Mode selection
     mode = "deterministic"
     if args.random:
         mode = "random"
-    elif args.stochastic:
+    if args.stochastic:
         mode = "stochastic"
+    if args.fixed_action is not None:
+        mode = f"fixed({args.fixed_action})"
 
     device = torch.device("cpu" if args.cpu or (not torch.cuda.is_available()) else "cuda")
 
-    ckpt = pick_checkpoint(args.run_dir)
-    print(f"Using checkpoint: {ckpt}")
-    print(f"Eval mode: {mode}")
-
+    # Case list
     if args.cases_file:
         case_ids = load_case_list(args.cases_file)
         if not os.environ.get("OPENKBP_CASE"):
@@ -168,21 +176,46 @@ def main():
     env = gym.make(args.env_id)
     env = gym.wrappers.RecordEpisodeStatistics(env)
 
-    n_actions = env.action_space.n
-    agent = Agent(n_actions=n_actions).to(device)
-    agent.load_state_dict(torch.load(ckpt, map_location=device))
-    agent.eval()
+    # Agent only needed for deterministic/stochastic
+    agent = None
+    ckpt = None
+    if args.fixed_action is None and mode != "random":
+        ckpt = pick_checkpoint(args.run_dir)
+        print(f"Using checkpoint: {ckpt}")
+        n_actions = env.action_space.n
+        agent = Agent(n_actions=n_actions).to(device)
+        sd = safe_torch_load(ckpt, device)
+        missing, unexpected = agent.load_state_dict(sd, strict=False)
+        if unexpected:
+            print(f"[load_state_dict] ignored unexpected keys (showing up to 8): {unexpected[:8]}")
+        if missing:
+            print(f"[load_state_dict] missing keys (showing up to 8): {missing[:8]}")
+        agent.eval()
+    else:
+        print("Using checkpoint: (none)")
+
+    print(f"Eval mode: {mode}")
 
     metrics = []
     if case_ids:
         for cid in case_ids:
             for i in range(args.episodes_per_case):
-                m = rollout(env, agent, device, mode, args.max_steps, args.seed + 1000 * i, case_id=cid)
-                metrics.append(m)
+                metrics.append(
+                    rollout(
+                        env, agent, device, "deterministic" if agent else "random",
+                        args.max_steps, args.seed + 1000 * i,
+                        case_id=cid, fixed_action=args.fixed_action
+                    )
+                )
     else:
         for i in range(args.episodes):
-            m = rollout(env, agent, device, mode, args.max_steps, args.seed + 1000 * i, case_id=None)
-            metrics.append(m)
+            metrics.append(
+                rollout(
+                    env, agent, device, "deterministic" if agent else "random",
+                    args.max_steps, args.seed + 1000 * i,
+                    case_id=None, fixed_action=args.fixed_action
+                )
+            )
 
     env.close()
 
