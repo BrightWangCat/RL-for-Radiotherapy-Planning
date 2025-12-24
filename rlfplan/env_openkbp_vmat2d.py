@@ -4,7 +4,7 @@ from __future__ import annotations
 import os
 import zlib
 from dataclasses import dataclass
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, Tuple
 
 import numpy as np
 import gymnasium as gym
@@ -78,6 +78,10 @@ class OpenKBPVMAT2DEnv(gym.Env):
     Termination:
       - early stop when (err_norm < 0.05) and (oar_pen_norm < 0.05)
       - truncated at max_steps (default 192 for 2 arcs)
+
+    IMPORTANT practical setting:
+      - `calibrate_init=True` will scale the baseline weights `s0` so that
+        reset() starts near PTV70 mean reference (paper-like "conformal start").
     """
 
     metadata = {"render_modes": []}
@@ -93,11 +97,16 @@ class OpenKBPVMAT2DEnv(gym.Env):
         max_steps: int = 192,
         oar_lambda: float = 0.02,
         seed: int = 0,
+        # machine constraints (paper-like)
         d0_min: int = 20,
         d0_max: int = 600,
         leaf_step_mm: int = 5,
+        # initialization
         init_leaf_half_width: int = 8,
         init_d0: int = 100,
+        # NEW: conformal-like initialization (recommended)
+        calibrate_init: bool = True,
+        init_scale_clip: Tuple[float, float] = (0.2, 6.0),
     ):
         super().__init__()
 
@@ -111,6 +120,7 @@ class OpenKBPVMAT2DEnv(gym.Env):
 
         self.case: OpenKBPCase = case
 
+        # If case_id wasn't provided, try to infer a stable identifier
         if not self.case_id:
             inferred = getattr(case, "case_id", None) or getattr(case, "patient_id", None)
             if inferred is not None:
@@ -128,30 +138,40 @@ class OpenKBPVMAT2DEnv(gym.Env):
         self.d0_max = int(d0_max)
         self.leaf_step_mm = int(leaf_step_mm)
 
+        self.init_leaf_half_width = int(init_leaf_half_width)
+        self.init_d0 = int(init_d0)
+
+        self.calibrate_init = bool(calibrate_init)
+        self.init_scale_clip = (float(init_scale_clip[0]), float(init_scale_clip[1]))
+
         self.model = self._build_grouped_model(self.case, self.K)
 
+        # spaces
         self.action_space = spaces.Discrete(15)
         self.observation_space = spaces.Box(low=0, high=255, shape=(96, 96, 2), dtype=np.uint8)
 
+        # plan state across control points
         self.x1_idx = np.zeros((self.n_cps,), dtype=np.int32)
         self.x2_idx = np.zeros((self.n_cps,), dtype=np.int32)
         self.d0 = np.zeros((self.n_cps,), dtype=np.int32)
 
-        self.init_leaf_half_width = int(init_leaf_half_width)
-        self.init_d0 = int(init_d0)
-
+        # base group weights
         self.s0 = np.ones((self.K,), dtype=np.float32)
 
+        # counters
         self.t = 0
         self.cp_idx = 0
 
+        # objective vector in possible-dose space
         self._obj_vec = self._build_objective_vec()
+
+        # stable image mapping (possible-dose -> 96x96)
         self._img_index_map = self._build_img_index_map()
 
     # -------------------- model + objectives --------------------
     @staticmethod
     def _build_grouped_model(case: OpenKBPCase, K: int) -> GroupedDoseModel:
-        A: sp.csr_matrix = case.A
+        A: sp.csr_matrix = case.A  # (nV, nB)
         nV, nB = A.shape
         K = min(int(K), int(nB))
         if K <= 0:
@@ -165,7 +185,7 @@ class OpenKBPVMAT2DEnv(gym.Env):
             c0, c1 = int(edges[g]), int(edges[g + 1])
             if c1 <= c0:
                 continue
-            Bg = Acsc[:, c0:c1].sum(axis=1)
+            Bg = Acsc[:, c0:c1].sum(axis=1)  # (nV, 1)
             B[:, g] = np.asarray(Bg).reshape(-1).astype(np.float32)
 
         ptv70 = case.struct_masks.get("PTV70", None)
@@ -191,6 +211,7 @@ class OpenKBPVMAT2DEnv(gym.Env):
         if spinalcord is not None:
             spinalcord_ref_mean = float(dose_ref[spinalcord].mean())
 
+        # Calibration so that s~=1 yields PTV70 mean near reference (when fully open)
         ones = np.ones((K,), dtype=np.float32)
         ptv_mean_per_unit = float((B @ ones)[ptv70].mean())
         if ptv_mean_per_unit <= 1e-8:
@@ -198,6 +219,7 @@ class OpenKBPVMAT2DEnv(gym.Env):
         gain = float(ptv70_ref_mean / ptv_mean_per_unit)
         B *= np.float32(gain)
 
+        # Heuristic order by PTV/OAR ratio
         ptv_gain = np.asarray(B[ptv70].mean(axis=0)).reshape(-1)
         oar_mask = None
         if brainstem is not None and spinalcord is not None:
@@ -230,8 +252,10 @@ class OpenKBPVMAT2DEnv(gym.Env):
         nV = int(self.model.B.shape[0])
         obj = np.zeros((nV,), dtype=np.float32)
 
+        # PTV objective
         obj[self.model.ptv70_mask] = np.float32(self.model.ptv70_ref_mean)
 
+        # OAR objectives (mean-based proxy)
         if self.model.brainstem_mask is not None:
             obj[self.model.brainstem_mask] = np.float32(self.model.brainstem_ref_mean)
         if self.model.spinalcord_mask is not None:
@@ -311,7 +335,7 @@ class OpenKBPVMAT2DEnv(gym.Env):
         w = self._effective_weights()
         return self.model.B @ w
 
-    # -------------------- image construction --------------------
+    # -------------------- images --------------------
     def _rotate_2d(self, img: np.ndarray, angle_deg: float) -> np.ndarray:
         if nd_rotate is None:
             return img
@@ -324,12 +348,12 @@ class OpenKBPVMAT2DEnv(gym.Env):
         ptv_vals = dose[self.model.ptv70_mask]
         ptv_max = float(np.max(ptv_vals)) if ptv_vals.size else float(np.max(dose))
         ptv_max = max(ptv_max, 1e-6)
-        scale = ptv_max / 1.08
+        scale = ptv_max / 1.08  # paper-like normalization
 
         dose_n = dose_img / scale
         obj_n = obj_img / scale
-
         diff = dose_n - obj_n
+
         frame = (diff + 1.0) * 50.0
         frame = np.clip(frame, 0.0, 255.0).astype(np.uint8)
 
@@ -367,8 +391,35 @@ class OpenKBPVMAT2DEnv(gym.Env):
         theta_deg = float(self.cp_idx) * (360.0 / float(self.n_cps))
         f1 = self._frame1(dose, theta_deg=theta_deg)
         f2 = self._frame2_sinogram()
-        obs = np.stack([f1, f2], axis=-1)
-        return obs.astype(np.uint8)
+        return np.stack([f1, f2], axis=-1).astype(np.uint8)
+
+    # -------------------- reset init calibration --------------------
+    def _calibrate_init_to_ptv(self) -> Dict[str, float]:
+        """
+        Scale s0 so that current plan PTV70 mean matches reference (within clip bounds).
+        Returns diagnostic info.
+        """
+        dose0 = self._dose()
+        ptv_mean0 = float(dose0[self.model.ptv70_mask].mean())
+        ref = float(self.model.ptv70_ref_mean)
+
+        eps = 1e-6
+        scale = ref / max(ptv_mean0, eps)
+
+        lo, hi = self.init_scale_clip
+        scale_clipped = float(np.clip(scale, lo, hi))
+
+        self.s0 *= np.float32(scale_clipped)
+
+        dose1 = self._dose()
+        ptv_mean1 = float(dose1[self.model.ptv70_mask].mean())
+
+        return {
+            "init_ptv_mean_before": ptv_mean0,
+            "init_ptv_mean_after": ptv_mean1,
+            "init_scale_raw": float(scale),
+            "init_scale_applied": float(scale_clipped),
+        }
 
     # -------------------- Gym API --------------------
     def reset(self, *, seed: Optional[int] = None, options: Optional[dict] = None):
@@ -379,6 +430,7 @@ class OpenKBPVMAT2DEnv(gym.Env):
 
         options = options or {}
 
+        # Optional: switch case on reset (for multi-case training)
         new_case_id = options.get("case_id", None)
         if new_case_id is not None and str(new_case_id) != str(self.case_id):
             if not self.root:
@@ -389,8 +441,10 @@ class OpenKBPVMAT2DEnv(gym.Env):
             self._obj_vec = self._build_objective_vec()
             self._img_index_map = self._build_img_index_map()
 
+        # base weights around [0.5, 1.0]
         self.s0 = (0.5 + self.rng.random(self.K, dtype=np.float32) * 0.5).astype(np.float32)
 
+        # Initialize plan: centered window + constant d0
         center = self.K // 2
         x1 = int(np.clip(center - self.init_leaf_half_width, 0, self.K - 2))
         x2 = int(np.clip(center + self.init_leaf_half_width, x1 + 1, self.K - 1))
@@ -401,6 +455,10 @@ class OpenKBPVMAT2DEnv(gym.Env):
 
         self.t = 0
         self.cp_idx = 0
+
+        calib_info = {}
+        if self.calibrate_init:
+            calib_info = self._calibrate_init_to_ptv()
 
         dose = self._dose()
         obs = self._obs(dose)
@@ -413,15 +471,19 @@ class OpenKBPVMAT2DEnv(gym.Env):
             "calibration_gain": float(self.model.gain),
             "cp_idx": int(self.cp_idx),
             "theta_deg": 0.0,
-            # For reset, "applied" == current
+
+            # plan params at reset
             "cp_applied": int(self.cp_idx),
             "theta_applied_deg": 0.0,
             "d0": int(self.d0[self.cp_idx]),
             "x1_mm": int(self.x1_idx[self.cp_idx]) * self.leaf_step_mm,
             "x2_mm": int(self.x2_idx[self.cp_idx]) * self.leaf_step_mm,
-            "d0_next": int(self.d0[self.cp_idx]),
-            "x1_next_mm": int(self.x1_idx[self.cp_idx]) * self.leaf_step_mm,
-            "x2_next_mm": int(self.x2_idx[self.cp_idx]) * self.leaf_step_mm,
+
+            # dose diagnostics at reset
+            "ptv70_mean": float(dose[self.model.ptv70_mask].mean()),
+
+            # init calibration diagnostics
+            **calib_info,
         }
         return obs, info
 
@@ -452,7 +514,7 @@ class OpenKBPVMAT2DEnv(gym.Env):
         if self.x2_idx[cp_applied] <= self.x1_idx[cp_applied]:
             self.x2_idx[cp_applied] = int(np.clip(self.x1_idx[cp_applied] + 1, 1, self.K - 1))
 
-        # snapshot applied values (for correct logging)
+        # snapshot applied values (correct logging)
         d0_applied = int(self.d0[cp_applied])
         x1_applied_mm = int(self.x1_idx[cp_applied]) * self.leaf_step_mm
         x2_applied_mm = int(self.x2_idx[cp_applied]) * self.leaf_step_mm
@@ -461,17 +523,18 @@ class OpenKBPVMAT2DEnv(gym.Env):
         self.cp_idx = (self.cp_idx + 1) % self.n_cps
         theta_deg = float(self.cp_idx) * (360.0 / float(self.n_cps))
 
-        # snapshot next cp values
+        # snapshot next cp values (optional)
         d0_next = int(self.d0[self.cp_idx])
         x1_next_mm = int(self.x1_idx[self.cp_idx]) * self.leaf_step_mm
         x2_next_mm = int(self.x2_idx[self.cp_idx]) * self.leaf_step_mm
 
         dose = self._dose()
 
-        # metrics
+        # --- metrics (mean-based proxy) ---
         ptv70_mean = float(dose[self.model.ptv70_mask].mean())
         ref = float(self.model.ptv70_ref_mean) + 1e-6
 
+        # symmetric under/over, with extra overdose penalty
         base_err = abs(ptv70_mean - float(self.model.ptv70_ref_mean)) / ref
         overdose = max(0.0, ptv70_mean - float(self.model.ptv70_ref_mean)) / ref
         err = float(base_err + overdose)
@@ -494,6 +557,7 @@ class OpenKBPVMAT2DEnv(gym.Env):
 
         oar_pen = float((bs_excess + sc_excess) / ref)
 
+        # PPO reward (maximize) = negative cost
         reward = -err - self.oar_lambda * oar_pen
 
         terminated = (err < 0.05) and (oar_pen < 0.05)
@@ -504,11 +568,11 @@ class OpenKBPVMAT2DEnv(gym.Env):
         info: Dict[str, Any] = {
             "case_id": self.case_id,
 
-            # environment "current" cp after advance
+            # current cp after advance
             "cp_idx": int(self.cp_idx),
             "theta_deg": float(theta_deg),
 
-            # action applied to which cp (this is the one that changed)
+            # action applied to which cp
             "cp_applied": int(cp_applied),
             "theta_applied_deg": float(theta_applied_deg),
             "action_index": int(a),
@@ -516,12 +580,12 @@ class OpenKBPVMAT2DEnv(gym.Env):
             "dx2_mm": int(dx2_mm),
             "dd0": int(dd0),
 
-            # Keep legacy keys d0/x1/x2 as APPLIED values (so your smoke-test prints show changes)
+            # legacy keys reflect APPLIED values (so your logging shows changes)
             "d0": int(d0_applied),
             "x1_mm": int(x1_applied_mm),
             "x2_mm": int(x2_applied_mm),
 
-            # Also provide next-cp values for reference
+            # next cp values for reference
             "d0_next": int(d0_next),
             "x1_next_mm": int(x1_next_mm),
             "x2_next_mm": int(x2_next_mm),
