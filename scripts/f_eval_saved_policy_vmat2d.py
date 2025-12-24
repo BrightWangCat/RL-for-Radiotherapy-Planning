@@ -2,7 +2,7 @@
 import os
 import glob
 import argparse
-from typing import List, Optional
+from typing import Optional
 
 import numpy as np
 import torch
@@ -17,8 +17,27 @@ import rlfplan.register_envs  # noqa: F401
 from rlfplan.wrappers.case_sampler import load_case_list
 
 
-def find_latest_checkpoint(run_dir: str) -> str:
-    pats = ["model_best.cleanrl_model", "model_last.cleanrl_model", "model.cleanrl_model", "*.cleanrl_model", "*.pt", "*.pth"]
+def pick_checkpoint(run_dir: str) -> str:
+    """
+    Deterministic priority (do NOT depend on mtime):
+      1) model_best.cleanrl_model
+      2) model_last.cleanrl_model
+      3) model.cleanrl_model
+      4) any *.cleanrl_model / *.pt / *.pth (newest)
+    """
+    p_best = os.path.join(run_dir, "model_best.cleanrl_model")
+    if os.path.isfile(p_best):
+        return p_best
+
+    p_last = os.path.join(run_dir, "model_last.cleanrl_model")
+    if os.path.isfile(p_last):
+        return p_last
+
+    p_compat = os.path.join(run_dir, "model.cleanrl_model")
+    if os.path.isfile(p_compat):
+        return p_compat
+
+    pats = ["*.cleanrl_model", "*.pt", "*.pth"]
     cands = []
     for p in pats:
         cands.extend(glob.glob(os.path.join(run_dir, p)))
@@ -50,11 +69,6 @@ class Agent(torch.nn.Module):
             torch.nn.Linear(n_flat, 512),
             torch.nn.ReLU(),
             torch.nn.Linear(512, n_actions),
-        )
-        self.critic = torch.nn.Sequential(
-            torch.nn.Linear(n_flat, 512),
-            torch.nn.ReLU(),
-            torch.nn.Linear(512, 1),
         )
 
     def _preprocess(self, x: torch.Tensor) -> torch.Tensor:
@@ -140,14 +154,12 @@ def main():
 
     device = torch.device("cpu" if args.cpu or (not torch.cuda.is_available()) else "cuda")
 
-    ckpt = find_latest_checkpoint(args.run_dir)
+    ckpt = pick_checkpoint(args.run_dir)
     print(f"Using checkpoint: {ckpt}")
     print(f"Eval mode: {mode}")
 
-    # Build env
     if args.cases_file:
         case_ids = load_case_list(args.cases_file)
-        # ensure env can init
         if not os.environ.get("OPENKBP_CASE"):
             os.environ["OPENKBP_CASE"] = str(case_ids[0])
     else:
