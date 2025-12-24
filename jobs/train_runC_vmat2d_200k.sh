@@ -6,7 +6,7 @@
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=8
 #SBATCH --gpus-per-node=1
-#SBATCH --time=02:30:00
+#SBATCH --time=00:30:00
 #SBATCH --output=logs/%x-%j.out
 #SBATCH --error=logs/%x-%j.err
 
@@ -37,7 +37,7 @@ export OPENKBP_INIT_LEAF_HALF_WIDTH="8"
 
 python scripts/e_train_openkbp_ppo_vmat2d.py \
   --env-id OpenKBPVMAT2D-v0 \
-  --total-timesteps 200000 \
+  --total-timesteps 20000 \
   --learning-rate 3e-4 \
   --num-envs 4 \
   --num-steps 128 \

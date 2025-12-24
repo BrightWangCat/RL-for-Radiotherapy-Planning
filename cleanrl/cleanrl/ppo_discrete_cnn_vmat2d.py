@@ -1,4 +1,4 @@
-# cleanrl/ppo_discrete_cnn_vmat2d.py
+# cleanrl/cleanrl/ppo_discrete_cnn_vmat2d.py
 from __future__ import annotations
 
 import os
@@ -92,13 +92,14 @@ def make_env(env_id: str, idx: int, seed: int):
 
 class Agent(nn.Module):
     """
-    CNN close to the classic (Mnih) / paper-like conv stack:
+    CNN (classic Atari-like conv stack):
       Conv1: 32 @ 8x8 stride4
       Conv2: 64 @ 4x4 stride2
       Conv3: 64 @ 3x3 stride1
       FC: 512
       Policy: 15 logits
       Value: 1
+
     Input: uint8 (N,96,96,2) -> float in [0,1], then (N,2,96,96)
     """
     def __init__(self, n_actions: int = 15):
@@ -137,8 +138,12 @@ class Agent(nn.Module):
         value = self.critic(x).squeeze(-1)
         return logits, value
 
-    @torch.no_grad()
     def get_action_and_value(self, obs_u8: torch.Tensor, action: torch.Tensor | None = None):
+        """
+        IMPORTANT: No @torch.no_grad() here.
+        - Rollout sampling should wrap this call in `with torch.no_grad():`
+        - PPO update should call it normally so gradients flow through logits/value.
+        """
         logits, value = self.forward(obs_u8)
         dist = torch.distributions.Categorical(logits=logits)
         if action is None:
@@ -168,7 +173,7 @@ def main():
 
     envs = gym.vector.SyncVectorEnv([make_env(args.env_id, i, args.seed) for i in range(args.num_envs)])
     assert isinstance(envs.single_action_space, gym.spaces.Discrete)
-    assert envs.single_observation_space.shape == (96, 96, 2)
+    assert tuple(envs.single_observation_space.shape) == (96, 96, 2)
 
     agent = Agent(n_actions=envs.single_action_space.n).to(device)
     optimizer = optim.Adam(agent.parameters(), lr=args.learning_rate, eps=1e-5)
@@ -198,12 +203,14 @@ def main():
             obs[step] = next_obs
             dones[step] = next_done
 
-            action, logprob, _, value = agent.get_action_and_value(next_obs)
+            with torch.no_grad():
+                action, logprob, _, value = agent.get_action_and_value(next_obs)
+
             actions[step] = action
             logprobs[step] = logprob
             values[step] = value
 
-            next_obs_np, reward_np, term_np, trunc_np, infos = envs.step(action.cpu().numpy())
+            next_obs_np, reward_np, term_np, trunc_np, _ = envs.step(action.cpu().numpy())
             done_np = np.logical_or(term_np, trunc_np)
 
             rewards[step] = torch.tensor(reward_np, dtype=torch.float32, device=device)
@@ -213,6 +220,7 @@ def main():
         # bootstrap value
         with torch.no_grad():
             _, next_value = agent.forward(next_obs)
+
         advantages = torch.zeros_like(rewards, device=device)
         lastgaelam = 0.0
         for t in reversed(range(args.num_steps)):
@@ -245,6 +253,7 @@ def main():
             for start in range(0, batch_size, minibatch_size):
                 mb_inds = inds[start:start + minibatch_size]
 
+                # NO no_grad here (we need gradients)
                 _, newlogprob, entropy, newvalue = agent.get_action_and_value(
                     b_obs[mb_inds], b_actions[mb_inds]
                 )
@@ -270,11 +279,9 @@ def main():
                 nn.utils.clip_grad_norm_(agent.parameters(), args.max_grad_norm)
                 optimizer.step()
 
-        # basic progress print (keep it simple)
         sps = int(global_step / max(1e-6, (time.time() - start_time)))
         print(f"update {update:04d}/{num_updates} step={global_step} SPS={sps}")
 
-        # save
         if args.save_model and (update == num_updates or update % 10 == 0):
             path = os.path.join(run_dir, "model.cleanrl_model")
             torch.save(agent.state_dict(), path)
