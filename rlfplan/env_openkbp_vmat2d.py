@@ -2,7 +2,6 @@
 from __future__ import annotations
 
 import os
-import zlib
 from dataclasses import dataclass
 from typing import Optional, Dict, Any, Tuple
 
@@ -13,8 +12,10 @@ import scipy.sparse as sp
 
 try:
     from scipy.ndimage import rotate as nd_rotate
+    from scipy.ndimage import binary_dilation as nd_binary_dilation
 except Exception:  # pragma: no cover
     nd_rotate = None
+    nd_binary_dilation = None
 
 from rlfplan.openkbp_case import OpenKBPCase
 
@@ -43,31 +44,43 @@ ACTIONS_15 = [
 
 @dataclass
 class GroupedDoseModel:
-    B: np.ndarray                    # (nV, K) float32 dense
-    ptv70_mask: np.ndarray           # (nV,) bool
-    brainstem_mask: Optional[np.ndarray]    # (nV,) bool or None
-    spinalcord_mask: Optional[np.ndarray]   # (nV,) bool or None
-    ptv70_ref_mean: float
-    brainstem_ref_mean: float
-    spinalcord_ref_mean: float
-    gain: float                      # calibration gain applied to B
-    order: np.ndarray                # (K,) int, sorted indices by PTV/OAR ratio desc
+    # FULL (possibly multi-slice) arrays in "possible-dose space"
+    B_full: np.ndarray                 # (nV, K) float32 dense
+    ptv_mask_full: np.ndarray          # (nV,) bool
+    brainstem_mask_full: Optional[np.ndarray]
+    spinalcord_mask_full: Optional[np.ndarray]
+
+    # reference stats (full, may be overwritten by slice stats)
+    ptv_ref_mean_full: float
+    brainstem_ref_mean_full: float
+    spinalcord_ref_mean_full: float
+
+    gain: float                        # calibration gain applied to B_full
+
+    # IMPORTANT: to align with paper leaf indexing semantics, we DO NOT reorder bins.
+    # Leaf indices are interpreted as lateral bins 0..K-1.
+    order: np.ndarray                  # identity 0..K-1
 
 
 class OpenKBPVMAT2DEnv(gym.Env):
     """
-    Paper-aligned IO (approximate VMAT dynamics) + fast incremental dose cache.
+    Paper-aligned IO for VMAT MPO (2D) with PPO as optimizer.
 
     Observation: uint8 (96,96,2)
-      - frame1: (normalized dose - objective map) rotated by -theta
-      - frame2: machine parameter sinogram
+      - frame1: (normalized dose - objective map), mask non-objective voxels=0,
+                rotate by -theta (gantry frame), rescale to uint8 via (+1)*50,
+                and set PTV boundary ring to 255.
+      - frame2: machine parameter sinogram: y=relative theta, x=[d0|x1|x2],
+                mark with 200/150/100; d0 spans left 30 pixels.
 
-    Action: Discrete(15) exactly Table I in paper
+    Action: Discrete(15) Table I (leaf +/-5mm/0 and dose rate +/-20/0)
     Gantry increment: 3.75° => 96 control points
+    Max steps: up to 2 gantry rotations (192) per paper.
 
-    Performance note:
-      - We maintain per-control-point mask & scale caches and a running sum over CPs.
-      - Each step updates only the modified CP contribution (O(K) instead of O(n_cps*K)).
+    Notes:
+      - If case contains multiple slices stacked in voxel order (96*96 per slice),
+        we can sample a slice at reset (paper: random slice each iteration).
+      - Reward is negative paper-like cost g(si). Termination uses paper early stop.
     """
 
     metadata = {"render_modes": []}
@@ -78,19 +91,22 @@ class OpenKBPVMAT2DEnv(gym.Env):
         *,
         root: Optional[str] = None,
         case_id: Optional[str] = None,
-        K: int = 64,
+
+        K: int = 96,                  # paper naturally aligns with 96 lateral bins
         n_cps: int = 96,
         max_steps: int = 192,
-        oar_lambda: float = 0.02,
-        action_lambda: float = 0.02,
-        seed: int = 0,
+
+        # paper constraints / parameters
         d0_min: int = 20,
         d0_max: int = 600,
         leaf_step_mm: int = 5,
-        init_leaf_half_width: int = 8,
+        ptv_margin_mm: int = 10,      # 1.0 cm margin for conformal init/limits
+
         init_d0: int = 100,
-        calibrate_init: bool = True,
-        init_scale_clip: Tuple[float, float] = (0.2, 6.0),
+        init_mode: str = "conformal",  # "conformal" or "constant"
+        sample_slices: bool = True,    # paper: random slice each iteration
+
+        seed: int = 0,
     ):
         super().__init__()
 
@@ -111,50 +127,63 @@ class OpenKBPVMAT2DEnv(gym.Env):
         self.K = int(K)
         self.n_cps = int(n_cps)
         self.max_steps = int(max_steps)
-        self.oar_lambda = float(oar_lambda)
-        self.action_lambda = float(action_lambda)
-
-        self.base_seed = int(seed)
-        self.rng = np.random.default_rng(self.base_seed)
 
         self.d0_min = int(d0_min)
         self.d0_max = int(d0_max)
         self.leaf_step_mm = int(leaf_step_mm)
-
-        self.init_leaf_half_width = int(init_leaf_half_width)
+        self.ptv_margin_mm = int(ptv_margin_mm)
         self.init_d0 = int(init_d0)
+        self.init_mode = str(init_mode).lower()
+        if self.init_mode not in ("conformal", "constant"):
+            raise ValueError("init_mode must be 'conformal' or 'constant'")
+        self.sample_slices = bool(sample_slices)
 
-        self.calibrate_init = bool(calibrate_init)
-        self.init_scale_clip = (float(init_scale_clip[0]), float(init_scale_clip[1]))
+        self.base_seed = int(seed)
+        self.rng = np.random.default_rng(self.base_seed)
 
+        # Build grouped model (identity leaf indexing)
         self.model = self._build_grouped_model(self.case, self.K)
 
-        # spaces
-        self.action_space = spaces.Discrete(15)
-        self.observation_space = spaces.Box(low=0, high=255, shape=(96, 96, 2), dtype=np.uint8)
+        # Full objective vector (per-voxel objective value). We will slice it.
+        self._obj_full = self._build_objective_vec_full()
 
-        # plan state across CPs (stored in ordered-axis indices)
+        # Slice system (active 2D view: exactly 96*96 voxels)
+        self._slice_len = 96 * 96
+        self._slice_candidates = self._discover_slice_candidates()
+        self._active_slice_idx = 0
+        self._active_offset = 0
+
+        # active slice views (set in reset)
+        self.B = None                   # (96*96, K)
+        self.ptv_mask = None            # (96*96,)
+        self.bs_mask = None             # (96*96,) or None
+        self.sc_mask = None             # (96*96,) or None
+        self.obj_vec = None             # (96*96,)
+
+        # PTV boundary ring in patient frame for active slice: (96,96) bool
+        self._ptv_ring_img0 = None
+
+        # per-CP allowed aperture open-limits (paper: within 1cm of target edge)
+        self._x1_min_allowed = np.zeros((self.n_cps,), dtype=np.int32)
+        self._x2_max_allowed = np.zeros((self.n_cps,), dtype=np.int32)
+
+        # plan state across CPs
         self.x1_idx = np.zeros((self.n_cps,), dtype=np.int32)
         self.x2_idx = np.zeros((self.n_cps,), dtype=np.int32)
         self.d0 = np.zeros((self.n_cps,), dtype=np.int32)
 
-        # base group weights
-        self.s0 = np.ones((self.K,), dtype=np.float32)
+        # cost normalization term gOAR(s0)
+        self._goar0 = 1.0
 
         # counters
         self.t = 0
         self.cp_idx = 0
 
-        # objective vector in possible-dose space
-        self._obj_vec = self._build_objective_vec()
+        # spaces
+        self.action_space = spaces.Discrete(15)
+        self.observation_space = spaces.Box(low=0, high=255, shape=(96, 96, 2), dtype=np.uint8)
 
-        # stable 96x96 index map
-        self._img_index_map = self._build_img_index_map()
-
-        # --- fast dose caches ---
-        # mask_cp: (n_cps, K) float32 0/1 in ORIGINAL group index space
-        # scale_cp: (n_cps,) float32 = d0/100
-        # sum_masked: (K,) float32 = sum_cp( mask_cp[cp] * scale_cp[cp] )
+        # --- fast plan caches (on K bins) ---
         self._mask_cp = np.zeros((self.n_cps, self.K), dtype=np.float32)
         self._scale_cp = np.zeros((self.n_cps,), dtype=np.float32)
         self._sum_masked = np.zeros((self.K,), dtype=np.float32)
@@ -162,6 +191,10 @@ class OpenKBPVMAT2DEnv(gym.Env):
     # -------------------- model + objectives --------------------
     @staticmethod
     def _build_grouped_model(case: OpenKBPCase, K: int) -> GroupedDoseModel:
+        """
+        Build dense grouped influence matrix B_full from sparse A.
+        Leaf indexing is identity 0..K-1 to align with paper semantics.
+        """
         A: sp.csr_matrix = case.A  # (nV, nB)
         nV, nB = A.shape
         K = min(int(K), int(nB))
@@ -179,8 +212,8 @@ class OpenKBPVMAT2DEnv(gym.Env):
             Bg = Acsc[:, c0:c1].sum(axis=1)
             B[:, g] = np.asarray(Bg).reshape(-1).astype(np.float32)
 
-        ptv70 = case.struct_masks.get("PTV70", None)
-        if ptv70 is None or int(ptv70.sum()) == 0:
+        ptv = case.struct_masks.get("PTV70", None)
+        if ptv is None or int(ptv.sum()) == 0:
             raise ValueError("PTV70 mask missing/empty in possible-dose space.")
 
         brainstem = case.struct_masks.get("Brainstem", None)
@@ -192,173 +225,221 @@ class OpenKBPVMAT2DEnv(gym.Env):
             spinalcord = None
 
         dose_ref = case.dose_ref
-        ptv70_ref_mean = float(dose_ref[ptv70].mean())
+        ptv_ref_mean = float(dose_ref[ptv].mean())
+        bs_ref_mean = float(dose_ref[brainstem].mean()) if brainstem is not None else 0.0
+        sc_ref_mean = float(dose_ref[spinalcord].mean()) if spinalcord is not None else 0.0
 
-        brainstem_ref_mean = float(dose_ref[brainstem].mean()) if brainstem is not None else 0.0
-        spinalcord_ref_mean = float(dose_ref[spinalcord].mean()) if spinalcord is not None else 0.0
-
-        # Calibration so that s~=1 yields PTV70 mean near reference when fully open
+        # Calibration gain so that "fully open" roughly matches reference magnitude.
         ones = np.ones((K,), dtype=np.float32)
-        ptv_mean_per_unit = float((B @ ones)[ptv70].mean())
+        ptv_mean_per_unit = float((B @ ones)[ptv].mean())
         if ptv_mean_per_unit <= 1e-8:
             raise ValueError("Calibration failed: ptv_mean_per_unit is ~0.")
-        gain = float(ptv70_ref_mean / ptv_mean_per_unit)
+        gain = float(ptv_ref_mean / ptv_mean_per_unit)
         B *= np.float32(gain)
 
-        # Heuristic order by PTV/OAR ratio
-        ptv_gain = np.asarray(B[ptv70].mean(axis=0)).reshape(-1)
-        oar_mask = None
-        if brainstem is not None and spinalcord is not None:
-            oar_mask = (brainstem | spinalcord)
-        elif brainstem is not None:
-            oar_mask = brainstem
-        elif spinalcord is not None:
-            oar_mask = spinalcord
-
-        if oar_mask is None:
-            order = np.arange(K, dtype=np.int32)
-        else:
-            oar_gain = np.asarray(B[oar_mask].mean(axis=0)).reshape(-1)
-            ratio = ptv_gain / (oar_gain + 1e-6)
-            order = np.argsort(-ratio).astype(np.int32)
+        order = np.arange(K, dtype=np.int32)  # identity order (paper-aligned leaf bins)
 
         return GroupedDoseModel(
-            B=B,
-            ptv70_mask=ptv70,
-            brainstem_mask=brainstem,
-            spinalcord_mask=spinalcord,
-            ptv70_ref_mean=ptv70_ref_mean,
-            brainstem_ref_mean=brainstem_ref_mean,
-            spinalcord_ref_mean=spinalcord_ref_mean,
+            B_full=B,
+            ptv_mask_full=ptv.astype(bool),
+            brainstem_mask_full=brainstem.astype(bool) if brainstem is not None else None,
+            spinalcord_mask_full=spinalcord.astype(bool) if spinalcord is not None else None,
+            ptv_ref_mean_full=ptv_ref_mean,
+            brainstem_ref_mean_full=bs_ref_mean,
+            spinalcord_ref_mean_full=sc_ref_mean,
             gain=gain,
             order=order,
         )
 
-    def _build_objective_vec(self) -> np.ndarray:
-        nV = int(self.model.B.shape[0])
+    def _build_objective_vec_full(self) -> np.ndarray:
+        """
+        Per-voxel objective value in the same dose units as dose_ref.
+        This is a simplification relative to the paper's Table II DVH objectives,
+        but keeps the "objective map" concept aligned structurally.
+        """
+        nV = int(self.model.B_full.shape[0])
         obj = np.zeros((nV,), dtype=np.float32)
 
-        obj[self.model.ptv70_mask] = np.float32(self.model.ptv70_ref_mean)
-        if self.model.brainstem_mask is not None:
-            obj[self.model.brainstem_mask] = np.float32(self.model.brainstem_ref_mean)
-        if self.model.spinalcord_mask is not None:
-            obj[self.model.spinalcord_mask] = np.float32(self.model.spinalcord_ref_mean)
-
+        obj[self.model.ptv_mask_full] = np.float32(self.model.ptv_ref_mean_full)
+        if self.model.brainstem_mask_full is not None:
+            obj[self.model.brainstem_mask_full] = np.float32(self.model.brainstem_ref_mean_full)
+        if self.model.spinalcord_mask_full is not None:
+            obj[self.model.spinalcord_mask_full] = np.float32(self.model.spinalcord_ref_mean_full)
         return obj
 
-    # -------------------- stable 96x96 mapping in possible-dose space --------------------
-    def _case_seed(self) -> int:
-        cid = (self.case_id or "").encode("utf-8")
-        h = zlib.adler32(cid) & 0xFFFFFFFF
-        return (self.base_seed ^ h) & 0xFFFFFFFF
+    # -------------------- slice handling (paper: random slice each iteration) --------------------
+    def _discover_slice_candidates(self) -> np.ndarray:
+        """
+        If nV is multiple of 96*96, treat as stacked slices and select those with PTV present.
+        Otherwise, treat as single slice (offset=0).
+        """
+        nV = int(self.model.B_full.shape[0])
+        H = self._slice_len
+        if nV < H:
+            raise ValueError(f"nV={nV} < 96*96={H}. Cannot form paper-aligned 96x96 state.")
+        if nV % H != 0:
+            # Not perfectly stacked; fallback to single slice at offset 0 (still deterministic).
+            return np.array([0], dtype=np.int32)
 
-    def _build_img_index_map(self) -> np.ndarray:
-        nV = int(self.model.B.shape[0])
-        obj_mask = (self._obj_vec != 0.0)
-        obj_idx = np.flatnonzero(obj_mask)
-        bg_idx = np.flatnonzero(~obj_mask)
+        nS = nV // H
+        ptv = self.model.ptv_mask_full
+        cand = []
+        for s in range(nS):
+            off = s * H
+            if np.any(ptv[off:off + H]):
+                cand.append(s)
+        if len(cand) == 0:
+            # if no ptv slice found, keep slice 0
+            cand = [0]
+        return np.array(cand, dtype=np.int32)
 
-        H = 96 * 96
-        rng = np.random.default_rng(self._case_seed())
+    def _set_active_slice(self, slice_idx: int):
+        """
+        Activate one 96x96 slice view by slicing B_full and masks/objectives.
+        """
+        nV = int(self.model.B_full.shape[0])
+        H = self._slice_len
 
-        if obj_idx.size >= H:
-            sel = rng.choice(obj_idx, size=H, replace=False)
-            sel = np.sort(sel)
-            return sel.astype(np.int32)
-
-        need = H - obj_idx.size
-        if bg_idx.size == 0:
-            pad = rng.choice(obj_idx, size=need, replace=True) if obj_idx.size > 0 else np.zeros((need,), dtype=np.int64)
+        if (nV % H) == 0:
+            off = int(slice_idx) * H
         else:
-            pad = rng.choice(bg_idx, size=need, replace=(bg_idx.size < need))
+            off = 0
 
-        idx = np.concatenate([np.sort(obj_idx), np.sort(pad)])
-        rng.shuffle(idx)
-        if idx.size != H:
-            raise RuntimeError(f"img_index_map size mismatch: {idx.size} vs {H}")
-        if np.any(idx < 0) or np.any(idx >= nV):
-            raise RuntimeError("img_index_map contains out-of-range indices.")
-        return idx.astype(np.int32)
+        self._active_slice_idx = int(slice_idx)
+        self._active_offset = int(off)
 
-    def _vec_to_96x96(self, v: np.ndarray) -> np.ndarray:
-        v = np.asarray(v, dtype=np.float32).reshape(-1)
-        if v.size != int(self.model.B.shape[0]):
-            raise ValueError(f"Expected v size {int(self.model.B.shape[0])}, got {v.size}")
-        if self._img_index_map is None or self._img_index_map.size != 96 * 96:
-            self._img_index_map = self._build_img_index_map()
-        return v[self._img_index_map].reshape(96, 96)
+        self.B = self.model.B_full[off:off + H, :].astype(np.float32, copy=False)
+        self.ptv_mask = self.model.ptv_mask_full[off:off + H].astype(bool, copy=False)
+        self.bs_mask = self.model.brainstem_mask_full[off:off + H].astype(bool, copy=False) if self.model.brainstem_mask_full is not None else None
+        self.sc_mask = self.model.spinalcord_mask_full[off:off + H].astype(bool, copy=False) if self.model.spinalcord_mask_full is not None else None
 
-    # -------------------- aperture mask helper (ordered axis -> original group index) --------------------
-    def _mask_from_x1x2(self, x1: int, x2: int) -> np.ndarray:
-        x1 = int(np.clip(x1, 0, self.K - 2))
-        x2 = int(np.clip(x2, x1 + 1, self.K - 1))
+        self.obj_vec = self._obj_full[off:off + H].astype(np.float32, copy=False)
 
-        # window positions in ordered axis
-        open_pos = np.arange(x1, x2 + 1, dtype=np.int32)
-        # map to original group indices
-        open_group_indices = self.model.order[open_pos]
+        # Build PTV boundary ring (patient frame)
+        ptv_img = self.ptv_mask.reshape(96, 96)
+        self._ptv_ring_img0 = self._ptv_boundary_ring(ptv_img)
 
-        m = np.zeros((self.K,), dtype=np.float32)
-        m[open_group_indices] = 1.0
-        return m
+    # -------------------- morphology / rotation helpers --------------------
+    @staticmethod
+    def _dilate3x3(mask: np.ndarray) -> np.ndarray:
+        """
+        Fallback binary dilation (3x3) if scipy.ndimage.binary_dilation is unavailable.
+        """
+        m = mask.astype(np.uint8)
+        p = np.pad(m, ((1, 1), (1, 1)), mode="constant", constant_values=0)
+        out = np.zeros_like(m)
+        for dy in (-1, 0, 1):
+            for dx in (-1, 0, 1):
+                out = np.maximum(out, p[1 + dy:1 + dy + m.shape[0], 1 + dx:1 + dx + m.shape[1]])
+        return out.astype(bool)
 
-    # -------------------- fast cache rebuild --------------------
-    def _rebuild_plan_cache(self):
-        self._scale_cp[:] = (self.d0.astype(np.float32) / 100.0)
-        # if all CP share same x1/x2, build one mask and broadcast
-        if np.all(self.x1_idx == self.x1_idx[0]) and np.all(self.x2_idx == self.x2_idx[0]):
-            m = self._mask_from_x1x2(int(self.x1_idx[0]), int(self.x2_idx[0]))
-            self._mask_cp[:] = m[None, :]
-            self._sum_masked[:] = m * float(self._scale_cp.sum())
+    def _ptv_boundary_ring(self, ptv_img: np.ndarray) -> np.ndarray:
+        """
+        Paper: voxels surrounding PTV set to 255 to indicate boundary.
+        We implement a 1-pixel ring outside PTV via dilation(ptv) & ~ptv.
+        """
+        if nd_binary_dilation is not None:
+            dil = nd_binary_dilation(ptv_img.astype(bool), iterations=1)
         else:
-            self._sum_masked[:] = 0.0
-            for cp in range(self.n_cps):
-                m = self._mask_from_x1x2(int(self.x1_idx[cp]), int(self.x2_idx[cp]))
-                self._mask_cp[cp] = m
-                self._sum_masked += m * float(self._scale_cp[cp])
+            dil = self._dilate3x3(ptv_img.astype(bool))
+        ring = np.logical_and(dil, ~ptv_img.astype(bool))
+        return ring.astype(bool)
 
-    # -------------------- plan -> dose (fast) --------------------
-    def _effective_weights(self) -> np.ndarray:
-        # mean over CPs, then apply s0
-        return (self._sum_masked / float(self.n_cps)) * self.s0
-
-    def _dose(self) -> np.ndarray:
-        w = self._effective_weights()
-        return self.model.B @ w
-
-    # -------------------- images --------------------
     def _rotate_2d(self, img: np.ndarray, angle_deg: float) -> np.ndarray:
         if nd_rotate is None:
             return img
+        # nearest-neighbor rotation to keep mask crisp
         return nd_rotate(img, angle=angle_deg, reshape=False, order=0, mode="constant", cval=0)
 
-    def _frame1(self, dose: np.ndarray, theta_deg: float) -> np.ndarray:
-        dose_img = self._vec_to_96x96(dose)
-        obj_img = self._vec_to_96x96(self._obj_vec)
+    # -------------------- plan mask + caches --------------------
+    def _mask_from_x1x2(self, x1: int, x2: int) -> np.ndarray:
+        """
+        Aperture mask on K lateral bins. Identity indexing (paper-aligned).
+        """
+        x1 = int(np.clip(x1, 0, self.K - 2))
+        x2 = int(np.clip(x2, x1 + 1, self.K - 1))
+        m = np.zeros((self.K,), dtype=np.float32)
+        m[x1:x2 + 1] = 1.0
+        return m
 
-        ptv_vals = dose[self.model.ptv70_mask]
+    def _rebuild_plan_cache(self):
+        self._scale_cp[:] = (self.d0.astype(np.float32) / 100.0)
+        self._sum_masked[:] = 0.0
+        for cp in range(self.n_cps):
+            m = self._mask_from_x1x2(int(self.x1_idx[cp]), int(self.x2_idx[cp]))
+            self._mask_cp[cp] = m
+            self._sum_masked += m * float(self._scale_cp[cp])
+
+    def _effective_weights(self) -> np.ndarray:
+        # mean over CPs
+        return (self._sum_masked / float(self.n_cps)).astype(np.float32)
+
+    def _dose(self) -> np.ndarray:
+        w = self._effective_weights()
+        # active 2D slice dose
+        return self.B @ w
+
+    # -------------------- paper-aligned state frames --------------------
+    def _frame1(self, dose: np.ndarray, theta_deg: float) -> np.ndarray:
+        """
+        Paper frame1:
+          - normalize dose so max PTV dose = 1.08
+          - subtract objective map (normalized by same scale)
+          - mask voxels without objective to 0
+          - rotate by -theta (gantry frame)
+          - rescale to uint8: (x + 1) * 50
+          - set PTV boundary ring to 255
+        """
+        dose = np.asarray(dose, dtype=np.float32).reshape(-1)
+        obj = np.asarray(self.obj_vec, dtype=np.float32).reshape(-1)
+
+        dose_img = dose.reshape(96, 96)
+        obj_img = obj.reshape(96, 96)
+
+        # normalization: max PTV dose == 1.08
+        ptv_vals = dose[self.ptv_mask]
         ptv_max = float(np.max(ptv_vals)) if ptv_vals.size else float(np.max(dose))
         ptv_max = max(ptv_max, 1e-6)
-        scale = ptv_max / 1.08  # paper-like normalization
+        scale = ptv_max / 1.08
 
         dose_n = dose_img / scale
         obj_n = obj_img / scale
         diff = dose_n - obj_n
 
+        # uint8 rescale (paper)
         frame = (diff + 1.0) * 50.0
         frame = np.clip(frame, 0.0, 255.0).astype(np.uint8)
 
+        # mask voxels with no objective
         frame[obj_img == 0.0] = 0
-        frame = self._rotate_2d(frame, angle_deg=-theta_deg)
-        return frame.astype(np.uint8)
+
+        # rotate into gantry frame
+        frame_rot = self._rotate_2d(frame, angle_deg=-theta_deg).astype(np.uint8)
+
+        # rotate boundary ring and set to 255
+        if self._ptv_ring_img0 is not None:
+            ring_u8 = (self._ptv_ring_img0.astype(np.uint8) * 255)
+            ring_rot = self._rotate_2d(ring_u8, angle_deg=-theta_deg)
+            frame_rot[ring_rot > 0] = 255
+
+        return frame_rot
 
     def _frame2_sinogram(self) -> np.ndarray:
+        """
+        Paper frame2:
+          - y-axis: relative theta
+          - x-axis: [d0 | x1 | x2]
+          - mark d0=200, x1=150, x2=100
+          - d0 spans left 30 pixels over [d0_min, d0_max]
+          - background 0
+        """
         H, W = 96, 96
         img = np.zeros((H, W), dtype=np.uint8)
 
         denom_d0 = max(1, (self.d0_max - self.d0_min))
         denom_x = max(1, (self.K - 1))
 
+        # fixed segmentation: d0=30 cols, x1=33 cols, x2=33 cols
         for cp in range(self.n_cps):
             r = int(cp % H)
 
@@ -374,6 +455,7 @@ class OpenKBPVMAT2DEnv(gym.Env):
             x2_col = 63 + int(np.clip(round(x2 / denom_x * 32), 0, 32))
             img[r, x2_col] = 100
 
+        # relative-theta alignment: keep current cp near middle row (48)
         shift = 48 - int(self.cp_idx % H)
         img = np.roll(img, shift=shift, axis=0)
         return img
@@ -384,28 +466,166 @@ class OpenKBPVMAT2DEnv(gym.Env):
         f2 = self._frame2_sinogram()
         return np.stack([f1, f2], axis=-1).astype(np.uint8)
 
-    # -------------------- reset init calibration --------------------
-    def _calibrate_init_to_ptv(self) -> Dict[str, float]:
-        dose0 = self._dose()
-        ptv_mean0 = float(dose0[self.model.ptv70_mask].mean())
-        ref = float(self.model.ptv70_ref_mean)
+    # -------------------- paper-aligned conformal init + constraints --------------------
+    def _idx_from_col(self, col: int) -> int:
+        # map image column 0..95 to leaf index 0..K-1
+        return int(np.clip(round(float(col) / 95.0 * float(self.K - 1)), 0, self.K - 1))
 
-        eps = 1e-6
-        scale = ref / max(ptv_mean0, eps)
-        lo, hi = self.init_scale_clip
-        scale_applied = float(np.clip(scale, lo, hi))
+    def _compute_conformal_aperture_limits(self):
+        """
+        For each CP, rotate PTV mask into gantry frame and compute x1/x2 edges
+        with 1cm margin. Also set open-limit constraints (paper: within 1cm of target edge).
+        """
+        margin_steps = int(round(float(self.ptv_margin_mm) / float(self.leaf_step_mm)))
+        ptv_img0 = self.ptv_mask.reshape(96, 96).astype(bool)
 
-        self.s0 *= np.float32(scale_applied)
+        for cp in range(self.n_cps):
+            theta = float(cp) * (360.0 / float(self.n_cps))
+            ptv_rot = self._rotate_2d(ptv_img0.astype(np.uint8), angle_deg=-theta) > 0
 
-        dose1 = self._dose()
-        ptv_mean1 = float(dose1[self.model.ptv70_mask].mean())
+            cols = np.where(ptv_rot.any(axis=0))[0]
+            if cols.size == 0:
+                # fallback to center small window
+                c0, c1 = 45, 50
+            else:
+                c0, c1 = int(cols.min()), int(cols.max())
 
-        return {
-            "init_ptv_mean_before": ptv_mean0,
-            "init_ptv_mean_after": ptv_mean1,
-            "init_scale_raw": float(scale),
-            "init_scale_applied": float(scale_applied),
+            x1_edge = self._idx_from_col(c0)
+            x2_edge = self._idx_from_col(c1)
+
+            x1_min = int(np.clip(x1_edge - margin_steps, 0, self.K - 2))
+            x2_max = int(np.clip(x2_edge + margin_steps, 1, self.K - 1))
+            if x2_max <= x1_min:
+                x2_max = int(np.clip(x1_min + 1, 1, self.K - 1))
+
+            self._x1_min_allowed[cp] = x1_min
+            self._x2_max_allowed[cp] = x2_max
+
+    def _init_plan_conformal_arc(self):
+        """
+        Initialize plan as conformal arc (2D approximation):
+          - for each CP, set x1/x2 to PTV edge + 1cm margin (in gantry frame)
+          - constant dose rate init_d0
+        """
+        self._compute_conformal_aperture_limits()
+        for cp in range(self.n_cps):
+            self.x1_idx[cp] = int(self._x1_min_allowed[cp])
+            self.x2_idx[cp] = int(self._x2_max_allowed[cp])
+        self.d0[:] = int(np.clip(self.init_d0, self.d0_min, self.d0_max))
+
+    def _init_plan_constant(self):
+        """
+        Constant parameter init (paper Appendix-style): fixed aperture and d0.
+        """
+        # allow full range (no "within margin" constraint)
+        self._x1_min_allowed[:] = 0
+        self._x2_max_allowed[:] = self.K - 1
+
+        center = self.K // 2
+        half_width = max(2, int(round(16 / float(self.leaf_step_mm))))  # ~1.6cm each side as default
+        x1 = int(np.clip(center - half_width, 0, self.K - 2))
+        x2 = int(np.clip(center + half_width, x1 + 1, self.K - 1))
+
+        self.x1_idx[:] = x1
+        self.x2_idx[:] = x2
+        self.d0[:] = int(np.clip(self.init_d0, self.d0_min, self.d0_max))
+
+    def _clip_aperture_to_limits(self, cp: int):
+        """
+        Paper constraint: leaf positions remain within 1cm of target edge (open limits).
+        We enforce:
+          x1 >= x1_min_allowed[cp]
+          x2 <= x2_max_allowed[cp]
+          and x2 > x1
+        """
+        cp = int(cp)
+        x1_min = int(self._x1_min_allowed[cp])
+        x2_max = int(self._x2_max_allowed[cp])
+
+        x1 = int(self.x1_idx[cp])
+        x2 = int(self.x2_idx[cp])
+
+        x1 = int(np.clip(x1, x1_min, self.K - 2))
+        x2 = int(np.clip(x2, 1, x2_max))
+
+        if x2 <= x1:
+            x2 = int(np.clip(x1 + 1, 1, x2_max))
+
+        self.x1_idx[cp] = x1
+        self.x2_idx[cp] = x2
+
+    # -------------------- paper-like cost + stopping --------------------
+    def _compute_goar_terms(self, dose_n: np.ndarray, obj_n: np.ndarray, ri: float) -> Tuple[float, Dict[str, float]]:
+        """
+        Paper gOAR is sum over OAR metrics max(Dk_i/ri - Dk_obj, 0).
+        Here we use mean dose as metric for Brainstem/SpinalCord (dataset dependent),
+        but keep the paper formula form.
+        """
+        terms: Dict[str, float] = {}
+        goar = 0.0
+
+        if self.bs_mask is not None and np.any(self.bs_mask):
+            dk_i = float(dose_n[self.bs_mask].mean())
+            dk_obj = float(obj_n[self.bs_mask].mean())  # constant within mask
+            t = max(dk_i / max(ri, 1e-6) - dk_obj, 0.0)
+            terms["brainstem"] = t
+            goar += t
+
+        if self.sc_mask is not None and np.any(self.sc_mask):
+            dk_i = float(dose_n[self.sc_mask].mean())
+            dk_obj = float(obj_n[self.sc_mask].mean())
+            t = max(dk_i / max(ri, 1e-6) - dk_obj, 0.0)
+            terms["spinalcord"] = t
+            goar += t
+
+        return float(goar), terms
+
+    def _compute_cost(self, dose: np.ndarray) -> Tuple[float, float, float, float, bool, Dict[str, Any]]:
+        """
+        Returns:
+          g_total, gPTV, gOAR, gOAR_ratio, eps_stop, extra_dict
+        """
+        dose = np.asarray(dose, dtype=np.float32).reshape(-1)
+        obj = np.asarray(self.obj_vec, dtype=np.float32).reshape(-1)
+
+        # normalize so max PTV dose = 1.08 (paper)
+        ptv_vals = dose[self.ptv_mask]
+        ptv_max = float(np.max(ptv_vals)) if ptv_vals.size else float(np.max(dose))
+        ptv_max = max(ptv_max, 1e-6)
+        scale = ptv_max / 1.08
+
+        dose_n = dose / scale
+        obj_n = obj / scale
+
+        # prescription level ri = 0.926 * DPTVmax (paper) -> ~1.0 when DPTVmax=1.08
+        dptv_max_n = float(np.max(dose_n[self.ptv_mask])) if np.any(self.ptv_mask) else float(np.max(dose_n))
+        ri = 0.926 * dptv_max_n
+
+        # gPTV = 1 - V_PTV_r
+        v_ptv_r = float(np.mean(dose_n[self.ptv_mask] >= ri)) if np.any(self.ptv_mask) else 0.0
+        gptv = 1.0 - v_ptv_r
+
+        # gOAR (paper form, metric simplified)
+        goar, goar_terms = self._compute_goar_terms(dose_n, obj_n, ri)
+
+        # normalize gOAR by gOAR(s0), denom >= 0.05, ratio <= 1 (paper)
+        denom = max(float(self._goar0), 0.05)
+        goar_ratio = min(goar / denom, 1.0)
+
+        # total cost g(si) = 0.5*gPTV + goar/goar0 (paper Eq.1 form)
+        g_total = 0.5 * gptv + goar_ratio
+
+        # early stopping criterion: gPTV<0.05 & gOAR<0.05 (paper)
+        eps_stop = (gptv < 0.05) and (goar < 0.05)
+
+        extra = {
+            "scale_ptvmax_to_1p08": float(scale),
+            "dptv_max_norm": float(dptv_max_n),
+            "ri_norm": float(ri),
+            "v_ptv_ri": float(v_ptv_r),
+            "goar_terms": goar_terms,
         }
+        return float(g_total), float(gptv), float(goar), float(goar_ratio), bool(eps_stop), extra
 
     # -------------------- Gym API --------------------
     def reset(self, *, seed: Optional[int] = None, options: Optional[dict] = None):
@@ -416,59 +636,66 @@ class OpenKBPVMAT2DEnv(gym.Env):
 
         options = options or {}
 
-        # Optional: switch case on reset (for multi-case training)
+        # Optional: switch case on reset (multi-case training)
         new_case_id = options.get("case_id", None)
         if new_case_id is not None and str(new_case_id) != str(self.case_id):
             if not self.root:
                 raise ValueError("To switch case_id via options, set OPENKBP_ROOT or pass root=.")
             self.case_id = str(new_case_id)
             self.case = OpenKBPCase.load(self.root, self.case_id)
+
+            # rebuild model/objectives/slice candidates
             self.model = self._build_grouped_model(self.case, self.K)
-            self._obj_vec = self._build_objective_vec()
-            self._img_index_map = self._build_img_index_map()
+            self._obj_full = self._build_objective_vec_full()
+            self._slice_candidates = self._discover_slice_candidates()
 
-        # random base weights around [0.5, 1.0]
-        self.s0 = (0.5 + self.rng.random(self.K, dtype=np.float32) * 0.5).astype(np.float32)
+        # choose active slice (paper: random training slice)
+        if self.sample_slices and self._slice_candidates.size > 0:
+            sidx = int(self.rng.choice(self._slice_candidates))
+        else:
+            sidx = int(self._slice_candidates[0]) if self._slice_candidates.size > 0 else 0
+        self._set_active_slice(sidx)
 
-        # Initialize plan: centered window + constant d0
-        center = self.K // 2
-        x1 = int(np.clip(center - self.init_leaf_half_width, 0, self.K - 2))
-        x2 = int(np.clip(center + self.init_leaf_half_width, x1 + 1, self.K - 1))
-
-        self.x1_idx[:] = x1
-        self.x2_idx[:] = x2
-        self.d0[:] = int(np.clip(self.init_d0, self.d0_min, self.d0_max))
+        # init plan
+        if self.init_mode == "conformal":
+            self._init_plan_conformal_arc()
+        else:
+            self._init_plan_constant()
 
         self.t = 0
         self.cp_idx = 0
 
-        # build fast caches for this baseline plan
+        # build caches for baseline plan
         self._rebuild_plan_cache()
 
-        calib_info = {}
-        if self.calibrate_init:
-            calib_info = self._calibrate_init_to_ptv()
+        # baseline dose + baseline gOAR(s0) for normalization
+        dose0 = self._dose()
+        g0, gptv0, goar0, goar_ratio0, eps0, extra0 = self._compute_cost(dose0)
+        self._goar0 = float(goar0)
 
-        dose = self._dose()
-        obs = self._obs(dose)
+        obs = self._obs(dose0)
 
         info = {
             "case_id": self.case_id,
-            "ptv70_ref_mean": float(self.model.ptv70_ref_mean),
-            "brainstem_ref_mean": float(self.model.brainstem_ref_mean),
-            "spinalcord_ref_mean": float(self.model.spinalcord_ref_mean),
+            "slice_idx": int(self._active_slice_idx),
+            "slice_offset": int(self._active_offset),
             "calibration_gain": float(self.model.gain),
+
             "cp_idx": int(self.cp_idx),
             "theta_deg": 0.0,
 
-            "cp_applied": int(self.cp_idx),
-            "theta_applied_deg": 0.0,
+            # applied (at cp=0)
             "d0": int(self.d0[self.cp_idx]),
             "x1_mm": int(self.x1_idx[self.cp_idx]) * self.leaf_step_mm,
             "x2_mm": int(self.x2_idx[self.cp_idx]) * self.leaf_step_mm,
 
-            "ptv70_mean": float(dose[self.model.ptv70_mask].mean()),
-            **calib_info,
+            # paper cost components at s0
+            "g_total": float(g0),
+            "g_ptv": float(gptv0),
+            "g_oar": float(goar0),
+            "g_oar_ratio": float(goar_ratio0),
+            "eps_stop": bool(eps0),
+            **extra0,
         }
         return obs, info
 
@@ -481,83 +708,64 @@ class OpenKBPVMAT2DEnv(gym.Env):
 
         dx1_mm, dx2_mm, dd0 = ACTIONS_15[a]
 
-        # apply to CURRENT control point
+        # apply to CURRENT control point (paper: replace current CP)
         cp_applied = int(self.cp_idx)
         theta_applied_deg = float(cp_applied) * (360.0 / float(self.n_cps))
 
         # old contribution for incremental update
         old_scale = float(self._scale_cp[cp_applied])
-        old_mask = self._mask_cp[cp_applied]  # view
+        old_mask = self._mask_cp[cp_applied]
         old_term = old_mask * np.float32(old_scale)
 
+        # convert mm to index steps
         dx1 = int(round(dx1_mm / float(self.leaf_step_mm)))
         dx2 = int(round(dx2_mm / float(self.leaf_step_mm)))
 
+        # update parameters
         self.x1_idx[cp_applied] = int(self.x1_idx[cp_applied]) + dx1
         self.x2_idx[cp_applied] = int(self.x2_idx[cp_applied]) + dx2
         self.d0[cp_applied] = int(self.d0[cp_applied]) + int(dd0)
 
-        # constraints on applied cp
+        # constraints (paper): d0 range; x1/x2 do not cross; within margin of PTV edge
         self.d0[cp_applied] = int(np.clip(self.d0[cp_applied], self.d0_min, self.d0_max))
         self.x1_idx[cp_applied] = int(np.clip(self.x1_idx[cp_applied], 0, self.K - 2))
         self.x2_idx[cp_applied] = int(np.clip(self.x2_idx[cp_applied], 1, self.K - 1))
         if self.x2_idx[cp_applied] <= self.x1_idx[cp_applied]:
             self.x2_idx[cp_applied] = int(np.clip(self.x1_idx[cp_applied] + 1, 1, self.K - 1))
 
+        # paper "within 1 cm of target edge" open-limits
+        self._clip_aperture_to_limits(cp_applied)
+
         # new mask & scale
         new_scale = float(self.d0[cp_applied]) / 100.0
         new_mask = self._mask_from_x1x2(int(self.x1_idx[cp_applied]), int(self.x2_idx[cp_applied]))
         new_term = new_mask * np.float32(new_scale)
 
-        # write caches
+        # write caches + incremental update
         self._scale_cp[cp_applied] = np.float32(new_scale)
         self._mask_cp[cp_applied] = new_mask
-
-        # incremental update of sum_masked
         self._sum_masked += (new_term - old_term)
 
-        # snapshot applied values for logging
-        d0_applied = int(self.d0[cp_applied])
-        x1_applied_mm = int(self.x1_idx[cp_applied]) * self.leaf_step_mm
-        x2_applied_mm = int(self.x2_idx[cp_applied]) * self.leaf_step_mm
-
-        # advance gantry / control point
+        # advance gantry / next CP
         self.cp_idx = (self.cp_idx + 1) % self.n_cps
         theta_deg = float(self.cp_idx) * (360.0 / float(self.n_cps))
 
-        # snapshot next cp values (optional)
-        d0_next = int(self.d0[self.cp_idx])
-        x1_next_mm = int(self.x1_idx[self.cp_idx]) * self.leaf_step_mm
-        x2_next_mm = int(self.x2_idx[self.cp_idx]) * self.leaf_step_mm
-
+        # dose + paper-like cost
         dose = self._dose()
+        g_total, gptv, goar, goar_ratio, eps_stop, extra = self._compute_cost(dose)
 
-        # metrics (mean-based proxy)
-        ptv70_mean = float(dose[self.model.ptv70_mask].mean())
-        ref = float(self.model.ptv70_ref_mean) + 1e-6
+        # PPO reward: maximize -> negative cost
+        reward = -g_total
 
-        base_err = abs(ptv70_mean - float(self.model.ptv70_ref_mean)) / ref
-        overdose = max(0.0, ptv70_mean - float(self.model.ptv70_ref_mean)) / ref
-        err = float(base_err + overdose)
-
-        bs_mean = float(dose[self.model.brainstem_mask].mean()) if self.model.brainstem_mask is not None else 0.0
-        sc_mean = float(dose[self.model.spinalcord_mask].mean()) if self.model.spinalcord_mask is not None else 0.0
-
-        bs_excess = max(0.0, bs_mean - float(self.model.brainstem_ref_mean)) if self.model.brainstem_mask is not None else 0.0
-        sc_excess = max(0.0, sc_mean - float(self.model.spinalcord_ref_mean)) if self.model.spinalcord_mask is not None else 0.0
-
-        oar_pen = float((bs_excess + sc_excess) / ref)
-
-        action_cost = 0.0 if a == 0 else 1.0
-        reward = -err - self.oar_lambda * oar_pen - self.action_lambda * action_cost
-
-        terminated = (err < 0.05) and (oar_pen < 0.05)
-        truncated = (self.t >= self.max_steps)
+        terminated = bool(eps_stop)
+        truncated = bool(self.t >= self.max_steps)
 
         obs = self._obs(dose)
 
         info: Dict[str, Any] = {
             "case_id": self.case_id,
+            "slice_idx": int(self._active_slice_idx),
+            "slice_offset": int(self._active_offset),
 
             "cp_idx": int(self.cp_idx),
             "theta_deg": float(theta_deg),
@@ -569,26 +777,24 @@ class OpenKBPVMAT2DEnv(gym.Env):
             "dx2_mm": int(dx2_mm),
             "dd0": int(dd0),
 
-            # legacy keys reflect APPLIED values
-            "d0": int(d0_applied),
-            "x1_mm": int(x1_applied_mm),
-            "x2_mm": int(x2_applied_mm),
+            # applied values (paper semantics)
+            "d0": int(self.d0[cp_applied]),
+            "x1_mm": int(self.x1_idx[cp_applied]) * self.leaf_step_mm,
+            "x2_mm": int(self.x2_idx[cp_applied]) * self.leaf_step_mm,
 
-            "d0_next": int(d0_next),
-            "x1_next_mm": int(x1_next_mm),
-            "x2_next_mm": int(x2_next_mm),
+            # paper cost components
+            "g_total": float(g_total),
+            "g_ptv": float(gptv),
+            "g_oar": float(goar),
+            "g_oar_ratio": float(goar_ratio),
+            "eps_stop": bool(eps_stop),
 
-            "ptv70_mean": float(ptv70_mean),
-            "ptv70_ref_mean": float(self.model.ptv70_ref_mean),
-            "brainstem_mean": float(bs_mean),
-            "spinalcord_mean": float(sc_mean),
-            "brainstem_ref_mean": float(self.model.brainstem_ref_mean),
-            "spinalcord_ref_mean": float(self.model.spinalcord_ref_mean),
-            "err_norm": float(err),
-            "oar_pen_norm": float(oar_pen),
+            # compatibility fields (older scripts)
+            "err_norm": float(g_total),
+            "oar_pen_norm": float(goar_ratio),
+
             "calibration_gain": float(self.model.gain),
-            "action_cost": float(action_cost),
-            "action_lambda": float(self.action_lambda),
+            **extra,
         }
 
-        return obs, float(reward), bool(terminated), bool(truncated), info
+        return obs, float(reward), terminated, truncated, info
