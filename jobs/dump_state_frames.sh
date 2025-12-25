@@ -5,7 +5,7 @@
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=2
-#SBATCH --time=00:10:00
+#SBATCH --time=00:01:00
 #SBATCH --output=logs/%x-%j.out
 #SBATCH --error=logs/%x-%j.err
 
@@ -38,6 +38,6 @@ python scripts/g_dump_state_frames.py \
   --case-id "${CASE_ID}" \
   --policy fixed \
   --fixed-action 0 \
-  --n-steps 10 \
+  --n-steps 0 \
   --outdir "state_frames_${CASE_ID}" \
   --tag "s"
