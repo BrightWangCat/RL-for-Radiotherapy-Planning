@@ -114,19 +114,57 @@ def main():
 
     # ---- Objective Map defaults (temporary) ----
     # These are common H&N constraints; we will replace with official open-kbp-opt objectives once you grep them from repo.
-    defaults_gy = {
-        "Brainstem": 54.0,
-        "SpinalCord": 45.0,
-        "LeftParotid": 26.0,
-        "RightParotid": 26.0,
+    # ---- Official open-kbp-opt criteria (from provided_code/constants_class.py) ----
+    criteria = {
+        ("D_0.1_cc", "Brainstem"): 50.0,
+        ("D_0.1_cc", "SpinalCord"): 45.0,
+        ("D_0.1_cc", "Mandible"): 73.5,
+        ("mean", "RightParotid"): 26.0,
+        ("mean", "LeftParotid"): 26.0,
+        ("mean", "Esophagus"): 45.0,
+        ("mean", "Larynx"): 45.0,
+        ("D_99", "PTV56"): -53.2,
+        ("D_99", "PTV63"): -59.85,
+        ("D_99", "PTV70"): -66.5,
     }
 
-    obj_map, obj_mask, ptv_union = build_objective_map(
-        dose_shape=dose.shape,
-        r=r,
-        structures=data.structures,
-        defaults_gy=defaults_gy,
-    )
+    # Convert criteria -> voxel-wise objective map (surrogate)
+    obj_map = np.zeros(dose.shape, dtype=np.float32)
+    obj_mask = np.zeros(dose.shape, dtype=bool)
+    ptv_union = np.zeros(dose.shape, dtype=bool)
+
+    # Targets: use abs(value) because negative means "higher is better"
+    # Priority overwrite: PTV70 > PTV63 > PTV56
+    for roi in ["PTV56", "PTV63", "PTV70"]:
+        key = ("D_99", roi)
+        if key not in criteria:
+            continue
+        if roi not in data.structures:
+            continue
+        m = data.structures[roi].astype(bool, copy=False)
+        if m.sum() == 0:
+            continue
+        ptv_union |= m
+        obj_map[m] = abs(float(criteria[key])) / (r + 1e-8)
+        obj_mask |= m
+
+    # OARs: treat D_0.1_cc / mean thresholds as per-voxel reference (surrogate)
+    for (metric, roi), val in criteria.items():
+        if roi.startswith("PTV"):
+            continue
+        if roi not in data.structures:
+            continue
+        m = data.structures[roi].astype(bool, copy=False)
+        if m.sum() == 0:
+            continue
+
+        # If overlaps exist, keep PTV objective (targets higher priority)
+        oar_vox = np.logical_and(m, ~ptv_union)
+
+        obj_map[oar_vox] = float(val) / (r + 1e-8)
+        obj_mask[oar_vox] = True
+
+
 
     # Apply objective mask rule from paper: voxels without objectives -> 0 :contentReference[oaicite:5]{index=5}
     frame1_raw = (dose_norm - obj_map) * obj_mask
