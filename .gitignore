@@ -44,6 +44,7 @@ htmlcov/
 # Top-level
 logs/
 runs/
+preprocess_outputs/
 
 # Common slurm output patterns anywhere
 slurm-*.out
