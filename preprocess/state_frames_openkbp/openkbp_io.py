@@ -13,113 +13,113 @@ except Exception:
     sparse = None
 
 
-def _read_numeric_series(path: Path, dtype=np.float32) -> np.ndarray:
-    """
-    Robust CSV reader for OpenKBP/OpenKBP-Opt style files.
+XY = 128 * 128
 
-    Handles:
-      - Optional header (e.g., column name 'data')
-      - Extra index columns
-      - Mixed types (e.g., first row 'data')
-    Strategy:
-      - read with pandas
-      - choose the column with most numeric entries (prefer column named 'data' if exists)
-      - coerce to numeric, drop NaNs
+
+def _read_index_and_optional_value(path: Path) -> Tuple[np.ndarray, Optional[np.ndarray]]:
+    """
+    Read OpenKBP-Opt sparse CSVs:
+      - ct.csv / dose.csv: (index, value) with header like ",data"
+      - masks (structures / possible_dose_mask): (index, <empty>) with same header
+
+    Returns:
+      idx: int64, shape (N,)
+      val: float32, shape (N,) or None if value column is empty
     """
     df = pd.read_csv(path, low_memory=False)
+    num = df.apply(pd.to_numeric, errors="coerce")
 
-    # Prefer explicit 'data' column if present
-    if "data" in df.columns:
-        ser = df["data"]
-        num = pd.to_numeric(ser, errors="coerce").dropna().to_numpy(dtype=dtype)
-        return num
+    # choose index column: integer-like, most non-NaN
+    def is_int_like(s: pd.Series) -> bool:
+        s2 = s.dropna()
+        if s2.empty:
+            return False
+        a = s2.to_numpy()
+        return np.all(np.isclose(a, np.round(a)))
 
-    # Otherwise choose the column that yields the most numeric entries
-    best = None
-    best_count = -1
-    for c in df.columns:
-        num_c = pd.to_numeric(df[c], errors="coerce")
-        cnt = int(num_c.notna().sum())
-        if cnt > best_count:
-            best_count = cnt
-            best = num_c
+    idx_col = None
+    best_cnt = -1
+    for c in num.columns:
+        s = num[c]
+        cnt = int(s.notna().sum())
+        if cnt <= 0:
+            continue
+        if not is_int_like(s):
+            continue
+        if cnt > best_cnt:
+            best_cnt = cnt
+            idx_col = c
 
-    if best is None or best_count <= 0:
-        raise ValueError(f"No numeric data detected in {path}")
+    if idx_col is None:
+        raise ValueError(f"No integer-like index column found in {path}")
 
-    return best.dropna().to_numpy(dtype=dtype)
+    # value column: among remaining columns pick one with most numeric entries
+    other_cols = [c for c in num.columns if c != idx_col]
+    val_col = None
+    val_cnt = 0
+    for c in other_cols:
+        cnt = int(num[c].notna().sum())
+        if cnt > val_cnt:
+            val_cnt = cnt
+            val_col = c
+
+    idx = num[idx_col].dropna().to_numpy(dtype=np.int64)
+
+    val = None
+    if val_col is not None and val_cnt > 0:
+        # align pairs (drop rows where either is NaN)
+        pair = num[[idx_col, val_col]].dropna()
+        idx = pair[idx_col].to_numpy(dtype=np.int64)
+        val = pair[val_col].to_numpy(dtype=np.float32)
+
+    # normalize to 0-based if it looks 1-based (no zeros, min>=1)
+    if idx.size > 0 and idx.min() >= 1 and not np.any(idx == 0):
+        idx = idx - 1
+
+    return idx, val
 
 
-def _infer_volume_shape_from_ct_len(nvox: int) -> Tuple[int, int, int]:
+def _infer_shape_from_max_index(max_idx: int) -> Tuple[int, int, int]:
     """
-    In OpenKBP-style data, x=y=128 in the downsampled axial plane.
-    z can vary (often 128) depending on dataset preprocessing.
+    Infer (128,128,z) from maximum voxel index present in sparse files.
+    We set nvox = XY * ceil((max_idx+1)/XY) to make it reshaped cleanly.
     """
-    xy = 128 * 128
-    if nvox % xy != 0:
-        raise ValueError(
-            f"Cannot infer (128,128,z) volume shape because ct length={nvox} "
-            f"is not divisible by 128*128={xy}. "
-            f"Please run `head -n 5 ct.csv` and `python -c 'import pandas as pd; print(pd.read_csv(\"ct.csv\").head())'` "
-            f"and share the output."
-        )
-    z = nvox // xy
+    n = int(max_idx) + 1
+    z = int(np.ceil(n / XY))
     return (128, 128, z)
 
 
-def _to_dense_mask(mask_data: np.ndarray, nvox: int) -> np.ndarray:
-    """
-    Convert mask representation to dense boolean mask of length nvox.
-
-    If length == nvox => treat as dense 0/1 (or floats), threshold at 0.5
-    Else => treat as sparse indices (int), set those indices True
-    """
-    if mask_data.size == nvox:
-        return (mask_data > 0.5)
-
-    # sparse indices
-    idx = mask_data.astype(np.int64, copy=False)
-    if idx.size == 0:
-        return np.zeros(nvox, dtype=bool)
-
-    # sanity check: indices should be within [0, nvox-1]
-    mx = int(idx.max())
-    mn = int(idx.min())
-    if mn < 0 or mx >= nvox:
-        raise ValueError(
-            f"Mask indices out of range: min={mn}, max={mx}, but nvox={nvox}. "
-            f"This suggests indices may be 1-based or the file format is different. "
-            f"Please run `head -n 10 {Path(mask_data).__str__()}` (or head on the mask csv) and share."
-        )
-
-    dense = np.zeros(nvox, dtype=bool)
-    dense[idx] = True
-    return dense
+def _dense_mask_from_indices(idx: np.ndarray, shape: Tuple[int, int, int]) -> np.ndarray:
+    nvox = int(np.prod(shape))
+    m = np.zeros(nvox, dtype=bool)
+    if idx.size > 0:
+        if idx.max() >= nvox:
+            raise ValueError(f"Index out of range: idx.max={int(idx.max())} >= nvox={nvox}")
+        m[idx] = True
+    return m.reshape(shape, order="F")
 
 
-def _to_dense_values(values_data: np.ndarray, nvox: int, fill_mask: Optional[np.ndarray] = None) -> np.ndarray:
-    """
-    Convert dose/ct-like data to dense float array of length nvox.
+def _dense_values_from_index_value(idx: np.ndarray, val: np.ndarray, shape: Tuple[int, int, int]) -> np.ndarray:
+    nvox = int(np.prod(shape))
+    out = np.zeros(nvox, dtype=np.float32)
+    if idx.size > 0:
+        if idx.max() >= nvox:
+            raise ValueError(f"Index out of range: idx.max={int(idx.max())} >= nvox={nvox}")
+        out[idx] = val.astype(np.float32, copy=False)
+    return out.reshape(shape, order="F")
 
-    If length == nvox => already dense.
-    Else if fill_mask is provided and values length == fill_mask.sum() => fill into zeros at mask locations.
-    """
-    if values_data.size == nvox:
-        return values_data.astype(np.float32, copy=False)
 
-    if fill_mask is not None:
-        k = int(fill_mask.sum())
-        if values_data.size == k:
-            out = np.zeros(nvox, dtype=np.float32)
-            out[fill_mask] = values_data.astype(np.float32, copy=False)
-            return out
-
-    raise ValueError(
-        f"Cannot densify values: values_len={values_data.size}, nvox={nvox}, "
-        f"mask_sum={(int(fill_mask.sum()) if fill_mask is not None else None)}. "
-        f"Likely file is stored as (index,value) pairs or another format. "
-        f"Please share first 5 lines via `head -n 5 <file>`."
-    )
+@dataclass
+class OpenKBPCasedata:
+    case_dir: Path
+    vol_shape: Tuple[int, int, int]          # (128,128,z)
+    ct: np.ndarray                            # float32 dense
+    dose: Optional[np.ndarray]                # float32 dense or None
+    possible_dose_mask: Optional[np.ndarray]  # bool dense or None
+    voxel_dimensions: np.ndarray
+    structures: Dict[str, np.ndarray]         # bool dense masks
+    beamlet_indices: Optional[pd.DataFrame]
+    dij: Optional[object]
 
 
 def list_case_dirs(root: Path) -> List[Path]:
@@ -128,71 +128,74 @@ def list_case_dirs(root: Path) -> List[Path]:
     return sorted(case_dirs, key=lambda p: p.name)
 
 
-@dataclass
-class OpenKBPCasedata:
-    case_dir: Path
-    vol_shape: Tuple[int, int, int]          # (128,128,z)
-    ct: np.ndarray                            # (128,128,z), float32
-    dose: Optional[np.ndarray]                # (128,128,z), float32 or None
-    possible_dose_mask: Optional[np.ndarray]  # (128,128,z), bool or None
-    voxel_dimensions: np.ndarray              # numeric entries from voxel_dimensions.csv
-    structures: Dict[str, np.ndarray]         # name -> (128,128,z) bool
-    beamlet_indices: Optional[pd.DataFrame]
-    dij: Optional[object]                     # scipy sparse matrix if loaded
-
-
 def load_case(case_dir: Path, load_dij: bool = False) -> OpenKBPCasedata:
     case_dir = Path(case_dir)
-    if not case_dir.exists():
-        raise FileNotFoundError(case_dir)
 
     ct_path = case_dir / "ct.csv"
-    voxdim_path = case_dir / "voxel_dimensions.csv"
-
-    ct_vec_raw = _read_numeric_series(ct_path, dtype=np.float32)
-    nvox = int(ct_vec_raw.size)
-    vol_shape = _infer_volume_shape_from_ct_len(nvox)
-
-    voxel_dimensions = _read_numeric_series(voxdim_path, dtype=np.float32)
-
-    # possible_dose_mask can be dense or sparse indices
-    possible_mask = None
-    pm_path = case_dir / "possible_dose_mask.csv"
-    if pm_path.exists():
-        pm_raw = _read_numeric_series(pm_path, dtype=np.float32)
-        pm_dense_1d = _to_dense_mask(pm_raw, nvox)
-        possible_mask = pm_dense_1d.reshape(vol_shape)
-
-    # densify ct (some variants store ct only on feasible mask; handle both)
-    ct_dense_1d = _to_dense_values(ct_vec_raw, nvox, fill_mask=(possible_mask.reshape(-1) if possible_mask is not None else None))
-    ct = ct_dense_1d.reshape(vol_shape)
-
-    # dose
-    dose = None
     dose_path = case_dir / "dose.csv"
-    if dose_path.exists():
-        dose_raw = _read_numeric_series(dose_path, dtype=np.float32)
-        fill_mask_1d = (possible_mask.reshape(-1) if possible_mask is not None else None)
-        dose_dense_1d = _to_dense_values(dose_raw, nvox, fill_mask=fill_mask_1d)
-        dose = dose_dense_1d.reshape(vol_shape)
-
-    # beamlet_indices
-    beamlet_indices = None
+    pm_path = case_dir / "possible_dose_mask.csv"
+    voxdim_path = case_dir / "voxel_dimensions.csv"
     bi_path = case_dir / "beamlet_indices.csv"
+
+    # 1) Read sparse sources FIRST to determine a safe global volume size
+    ct_idx, ct_val = _read_index_and_optional_value(ct_path)
+    if ct_val is None:
+        raise ValueError(f"ct.csv should have (index,value) but value column seems empty: {ct_path}")
+    max_idx = int(ct_idx.max()) if ct_idx.size > 0 else 0
+
+    pm_idx = None
+    if pm_path.exists():
+        pm_idx, _ = _read_index_and_optional_value(pm_path)
+        if pm_idx.size > 0:
+            max_idx = max(max_idx, int(pm_idx.max()))
+
+    dose_idx = None
+    dose_val = None
+    if dose_path.exists():
+        dose_idx, dose_val = _read_index_and_optional_value(dose_path)
+        if dose_val is None:
+            raise ValueError(f"dose.csv should have (index,value) but value column seems empty: {dose_path}")
+        if dose_idx.size > 0:
+            max_idx = max(max_idx, int(dose_idx.max()))
+
+    # 2) Infer shape from the maximum index across ct/dose/mask
+    vol_shape = _infer_shape_from_max_index(max_idx)
+
+    # 3) Densify CT / Dose / possible mask into that shape
+    ct = _dense_values_from_index_value(ct_idx, ct_val, vol_shape)
+
+    dose = None
+    if dose_idx is not None and dose_val is not None:
+        dose = _dense_values_from_index_value(dose_idx, dose_val, vol_shape)
+
+    possible_mask = None
+    if pm_idx is not None:
+        possible_mask = _dense_mask_from_indices(pm_idx, vol_shape)
+
+    # 4) voxel_dimensions (small dense list)
+    vdf = pd.read_csv(voxdim_path, low_memory=False)
+    vnum = vdf.apply(pd.to_numeric, errors="coerce")
+    voxel_dimensions = vnum.stack().dropna().to_numpy(dtype=np.float32)
+
+    # 5) beamlet_indices (table)
+    beamlet_indices = None
     if bi_path.exists():
         beamlet_indices = pd.read_csv(bi_path, low_memory=False)
 
-    # structures: treat as dense if length==nvox else sparse indices
-    known = {"ct.csv", "dose.csv", "possible_dose_mask.csv", "voxel_dimensions.csv", "beamlet_indices.csv"}
+    # 6) Structures: indices-only masks (fit into the inferred shape)
+    known = {
+        "ct.csv", "dose.csv", "possible_dose_mask.csv",
+        "voxel_dimensions.csv", "beamlet_indices.csv"
+    }
     structures: Dict[str, np.ndarray] = {}
     for csv_path in sorted(case_dir.glob("*.csv")):
         if csv_path.name in known:
             continue
         name = csv_path.stem
-        raw = _read_numeric_series(csv_path, dtype=np.float32)
-        dense_1d = _to_dense_mask(raw, nvox)
-        structures[name] = dense_1d.reshape(vol_shape)
+        s_idx, _ = _read_index_and_optional_value(csv_path)
+        structures[name] = _dense_mask_from_indices(s_idx, vol_shape)
 
+    # 7) dij
     dij_obj = None
     if load_dij:
         if sparse is None:
